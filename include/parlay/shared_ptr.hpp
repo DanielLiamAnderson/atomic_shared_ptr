@@ -37,9 +37,6 @@ struct control_block_base : public GarbageBase {
   
   template<typename T>
   friend class atomic_shared_ptr;
-  
-  alignas(void*) std::atomic<ref_cnt_type> strong_count;
-  std::atomic<ref_cnt_type> weak_count;
 
   template<typename... Args>
   explicit control_block_base() noexcept : strong_count(1), weak_count(1) { }
@@ -62,16 +59,17 @@ struct control_block_base : public GarbageBase {
   
   // Increment the strong reference count.  The strong reference count must not be zero
   void increment_strong_count() noexcept {
-    assert(strong_count.load() > 0);
-    strong_count.fetch_add(1, std::memory_order_relaxed);     // TODO: Explain why relaxed is safe here
+    assert(strong_count.load(std::memory_order_relaxed) > 0);
+    strong_count.fetch_add(1, std::memory_order_relaxed);
   }
   
   // Increment the strong reference count if it is not zero. Return true if successful,
   // otherwise return false indicating that the strong reference count is zero.
   bool increment_strong_count_if_nonzero() noexcept {
-    auto current = strong_count.load();
+    auto current = strong_count.load(std::memory_order_relaxed);
     while (current != 0) {
-      if (strong_count.compare_exchange_strong(current, current + 1)) {
+      if (strong_count.compare_exchange_strong(current, current + 1,
+          std::memory_order_acq_rel, std::memory_order_relaxed)) {
         return true;
       }
     }
@@ -113,8 +111,12 @@ struct control_block_base : public GarbageBase {
 
   virtual void* get_ptr() const noexcept = 0;
 
-  auto get_use_count() const noexcept { return strong_count.load(); }
-  auto get_weak_count() const noexcept { return weak_count.load(); }
+  auto get_use_count() const noexcept { return strong_count.load(std::memory_order_relaxed); }
+  auto get_weak_count() const noexcept { return weak_count.load(std::memory_order_relaxed); }
+  
+ private:
+  alignas(void*) std::atomic<ref_cnt_type> strong_count;
+  std::atomic<ref_cnt_type> weak_count;
 };
 
 
