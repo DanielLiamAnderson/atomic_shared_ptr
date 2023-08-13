@@ -14,6 +14,7 @@
 #include <memory>
 
 #include "details/hazard_pointers.hpp"
+#include "details/wait_free_counter.hpp"
 
 namespace parlay {
 
@@ -60,12 +61,15 @@ struct control_block_base : public GarbageBase {
   // Increment the strong reference count.  The strong reference count must not be zero
   void increment_strong_count() noexcept {
     assert(strong_count.load(std::memory_order_relaxed) > 0);
-    strong_count.fetch_add(1, std::memory_order_relaxed);
+    //strong_count.fetch_add(1, std::memory_order_relaxed);
+    strong_count.increment(1, std::memory_order_relaxed);
   }
   
   // Increment the strong reference count if it is not zero. Return true if successful,
   // otherwise return false indicating that the strong reference count is zero.
   bool increment_strong_count_if_nonzero() noexcept {
+    return strong_count.increment(1, std::memory_order_relaxed);
+    /*
     auto current = strong_count.load(std::memory_order_relaxed);
     while (current != 0) {
       if (strong_count.compare_exchange_strong(current, current + 1,
@@ -74,6 +78,7 @@ struct control_block_base : public GarbageBase {
       }
     }
     return false;
+     */
   }
   
   // Release a strong reference to the object. If the strong reference count hits zero,
@@ -83,9 +88,11 @@ struct control_block_base : public GarbageBase {
 
     // A decrement-release + an acquire fence is recommended by Boost's documentation:
     // https://www.boost.org/doc/libs/1_57_0/doc/html/atomic/usage_examples.html
-    // Alternatively, an acquire-release decrement would work, but might be less efficient since the
-    // acquire is only relevant if the decrement zeros the counter.
-    if (strong_count.fetch_sub(1, std::memory_order_release) == 1) {
+    // Alternatively, an acquire-release decrement would work, but might be less efficient
+    // since the acquire is only relevant if the decrement zeros the counter.
+
+    //if (strong_count.fetch_sub(1, std::memory_order_release) == 1) {
+    if (strong_count.decrement(1, std::memory_order_release)) {
       std::atomic_thread_fence(std::memory_order_acquire);
       
       // The strong reference count has hit zero, so the managed object can be disposed of.
@@ -115,7 +122,8 @@ struct control_block_base : public GarbageBase {
   auto get_weak_count() const noexcept { return weak_count.load(std::memory_order_relaxed); }
   
  private:
-  alignas(void*) std::atomic<ref_cnt_type> strong_count;
+  //alignas(void*) std::atomic<ref_cnt_type> strong_count;
+  alignas(void*) WaitFreeCounter<ref_cnt_type> strong_count;
   std::atomic<ref_cnt_type> weak_count;
 };
 

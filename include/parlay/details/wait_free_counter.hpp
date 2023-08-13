@@ -31,16 +31,8 @@ struct WaitFreeCounter {
 
   T load(std::memory_order order = std::memory_order_seq_cst) const noexcept {
     auto val = x.load(order);
-    if (val == 0) {
-      if (x.compare_exchange_strong(val, zero_flag | zero_pending_flag)) return 0;
-      if (val & zero_flag) return 0;
-      else return val;
-    }
+    if (val == 0 && x.compare_exchange_strong(val, zero_flag | zero_pending_flag)) [[unlikely]] return 0;
     return (val & zero_flag) ? 0 : val;
-  }
-
-  bool compare_exchange_strong(T& expected, T desired) noexcept {
-    return x.compare_exchange_strong(expected, desired);
   }
 
   // Increment the counter by arg. Returns false on failure, i.e., if the counter
@@ -51,12 +43,14 @@ struct WaitFreeCounter {
   }
 
   // Decrement the counter by arg. Returns true if this operation was responsible
-  // for decrementing the counter to zero. Otherwise returns false.
-  T decrement(T arg, std::memory_order order = std::memory_order_seq_cst) noexcept {
+  // for decrementing the counter to zero. Otherwise, returns false.
+  bool decrement(T arg, std::memory_order order = std::memory_order_seq_cst) noexcept {
     if (x.fetch_sub(arg, order) == arg) {
-      T current = 0;
-      if (x.compare_exchange_strong(current, zero_flag)) return true;
-      else if (current & zero_pending_flag) { return x.compare_exchange_strong(current, zero_flag); }
+      T expected = 0;
+      if (x.compare_exchange_strong(expected, zero_flag)) [[likely]]
+        return true;
+      else if ((expected & zero_pending_flag) && (x.exchange(zero_flag) & zero_pending_flag))
+        return true;
     }
     return false;
   }
