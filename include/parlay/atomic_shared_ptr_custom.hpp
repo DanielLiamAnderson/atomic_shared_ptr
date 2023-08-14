@@ -18,7 +18,7 @@ class atomic_shared_ptr {
   
  public:
   
-  atomic_shared_ptr() noexcept : control_block{nullptr} { }
+  atomic_shared_ptr() noexcept = default;
   atomic_shared_ptr(std::nullptr_t) noexcept : control_block{nullptr} { }
   
   atomic_shared_ptr(shared_ptr_type desired) {
@@ -40,7 +40,7 @@ class atomic_shared_ptr {
   [[nodiscard]] shared_ptr_type load([[maybe_unused]] std::memory_order order = std::memory_order_seq_cst) const {
     control_block_type* current_control_block = nullptr;
     
-    auto& hazptr = get_hazard_list();
+    auto& hazptr = get_hazard_list<control_block_type>();
     
     while (true) {
       current_control_block = hazptr.protect(control_block);
@@ -102,9 +102,9 @@ class atomic_shared_ptr {
   bool compare_exchange_weak(shared_ptr_type& expected, const shared_ptr_type& desired,
       std::memory_order success, std::memory_order failure) {
     
-    // This version is not very efficient and should be avoided.  Its just here to provide the complete
+    // This version is not very efficient and should be avoided.  It's just here to provide the complete
     // API of atomic<shared_ptr>.  The issue with it is that if the compare_exchange fails, the reference
-    // count of desired is incremeneted and decremented for no reason.  On the other hand, the rvalue
+    // count of desired is incremented and decremented for no reason.  On the other hand, the rvalue
     // version doesn't modify the reference count of desired at all.
     
     return compare_exchange_weak(expected, shared_ptr_type{desired}, success, failure);
@@ -114,9 +114,9 @@ class atomic_shared_ptr {
   bool compare_exchange_strong(shared_ptr_type& expected, const shared_ptr_type& desired,
       std::memory_order success, std::memory_order failure) {
   
-    // This version is not very efficient and should be avoided.  Its just here to provide the complete
+    // This version is not very efficient and should be avoided.  It's just here to provide the complete
     // API of atomic<shared_ptr>.  The issue with it is that if the compare_exchange fails, the reference
-    // count of desired is incremeneted and decremented for no reason.  On the other hand, the rvalue
+    // count of desired is incremented and decremented for no reason.  On the other hand, the rvalue
     // version doesn't modify the reference count of desired at all.
   
     return compare_exchange_strong(expected, shared_ptr_type{desired}, success, failure);

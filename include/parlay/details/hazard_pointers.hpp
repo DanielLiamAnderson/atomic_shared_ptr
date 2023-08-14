@@ -38,22 +38,26 @@ inline constexpr std::size_t CACHE_LINE_ALIGNMENT = 64;
 #endif
 
 
-// Base class for control blocks protected by hazard pointers
-struct GarbageBase {
-  GarbageBase*& get_next() { return next_; }
-  virtual void destroy() = 0;
-  GarbageBase* next_;
+template<typename T>
+concept GarbageCollectible = requires(T t) {
+  { t.get_next() } -> std::same_as<T*&>;     // The object should expose a next_ ptr
+  { t.destroy() };                           // The object should be destructible on demand
 };
 
+template<typename GarbageType>
+  requires GarbageCollectible<GarbageType>
 class HazardList;
 
-extern inline HazardList& get_hazard_list();
+template<typename GarbageType>
+extern inline HazardList<GarbageType>& get_hazard_list();
 
+template<typename GarbageType>
+  requires GarbageCollectible<GarbageType>
 class HazardList {
   
   constexpr static std::size_t cleanup_threshold = 1000;
   
-  using garbage_type = GarbageBase;
+  using garbage_type = GarbageType;
   
  private: 
   
@@ -140,8 +144,9 @@ class HazardList {
       delete old;
     }
   }
-  
-  friend HazardList& get_hazard_list();
+
+  template<typename U>
+  friend HazardList<U>& get_hazard_list();
   
   HazardSlot* get_slot() {
     auto current = head;
@@ -169,10 +174,10 @@ class HazardList {
   }
   
   struct ThreadManager {
-    ThreadManager() : my_slot(get_hazard_list().get_slot()) { }
+    ThreadManager() : my_slot(get_hazard_list<GarbageType>().get_slot()) { }
     
     ~ThreadManager() {
-      get_hazard_list().relinquish_slot(my_slot);
+      get_hazard_list<GarbageType>().relinquish_slot(my_slot);
     }
     
     HazardSlot* const my_slot;
@@ -256,8 +261,9 @@ class HazardList {
 
 
 // Global singleton containing the list of hazard pointers
-HazardList& get_hazard_list() {
-  static HazardList list;
+template<typename GarbageType>
+HazardList<GarbageType>& get_hazard_list() {
+  static HazardList<GarbageType> list;
   return list;
 }
 

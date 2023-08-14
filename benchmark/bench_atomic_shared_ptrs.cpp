@@ -38,6 +38,22 @@ struct StlAtomicSharedPtr {
 
 #endif
 
+
+constexpr auto compute_low = [](std::vector<double>& v) -> double {
+  std::nth_element(v.begin(), v.begin() + v.size()/100, v.end());
+  return v[v.size()/100];
+};
+
+constexpr auto compute_med = [](std::vector<double>& v) -> double {
+  std::nth_element(v.begin(), v.begin() + v.size()/2, v.end());
+  return v[v.size()/100];
+};
+
+constexpr auto compute_high = [](std::vector<double>& v) -> double {
+  std::nth_element(v.begin(), v.begin() + v.size()*99/100, v.end());
+  return v[v.size()*99/100];
+};
+
 template<typename T, typename... Args>
 inline extern T& get_singleton(Args&&... args) {
   static T t(std::forward<Args>(args)...);
@@ -48,31 +64,45 @@ template<template<typename> typename AtomicSharedPtr, template<typename> typenam
 static void bench_load(benchmark::State& state) {
   AtomicSharedPtr<int>& src = get_singleton<AtomicSharedPtr<int>>(SharedPtr<int>(new int(42)));
 
-  for (auto _ : state) {
-    auto start = std::chrono::steady_clock::now();
-    auto result = src.load();
-    auto finish = std::chrono::steady_clock::now();
+  std::vector<double> all_times;
 
-    auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(finish - start);
-    state.SetIterationTime(elapsed_seconds.count());
+  for (auto _ : state) {
+    auto start = std::chrono::high_resolution_clock::now();
+    auto result = src.load();
+    auto finish = std::chrono::high_resolution_clock::now();
+
+    auto elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(finish - start);
+    state.SetIterationTime(elapsed_time.count());
+    all_times.push_back(elapsed_time.count());
   }
+
+  state.counters["1%"] = compute_low(all_times);
+  state.counters["50%"] = compute_med(all_times);
+  state.counters["99%"] = compute_high(all_times);
 }
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
 static void bench_store_delete(benchmark::State& state) {
   AtomicSharedPtr<int>& src = get_singleton<AtomicSharedPtr<int>>(SharedPtr<int>(new int(42)));
 
+  std::vector<double> all_times;
+
   // These stores all overwrite the only copy of the pointer, so it will trigger destruction
   // of the managed object. This benchmark therefore also measures the cost of destruction.
   for (auto _ : state) {
     auto new_sp = SharedPtr<int>(new int(rand()));
-    auto start = std::chrono::steady_clock::now();
+    auto start = std::chrono::high_resolution_clock::now();
     src.store(std::move(new_sp));
-    auto finish = std::chrono::steady_clock::now();
+    auto finish = std::chrono::high_resolution_clock::now();
 
-    auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(finish - start);
-    state.SetIterationTime(elapsed_seconds.count());
+    auto elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(finish - start);
+    state.SetIterationTime(elapsed_time.count());
+    all_times.push_back(elapsed_time.count());
   }
+
+  state.counters["1%"] = compute_low(all_times);
+  state.counters["50%"] = compute_med(all_times);
+  state.counters["99%"] = compute_high(all_times);
 }
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
@@ -81,38 +111,31 @@ static void bench_store_copy(benchmark::State& state) {
 
   auto my_sp = SharedPtr<int>(new int(42));
 
+  std::vector<double> all_times;
+
   // In this version, we keep a copy of our own pointer and store a copy of it, so it will
   // never be destroyed.  This version is therefore only testing the efficiency of store
   // without also testing the efficiency destruction.
   for (auto _ : state) {
     auto new_sp = my_sp;
-    auto start = std::chrono::steady_clock::now();
+    auto start = std::chrono::high_resolution_clock::now();
     src.store(std::move(new_sp));
-    auto finish = std::chrono::steady_clock::now();
+    auto finish = std::chrono::high_resolution_clock::now();
 
-    auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(finish - start);
-    state.SetIterationTime(elapsed_seconds.count());
+    auto elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(finish - start);
+    state.SetIterationTime(elapsed_time.count());
+    all_times.push_back(elapsed_time.count());
   }
+
+  state.counters["1%"] = compute_low(all_times);
+  state.counters["50%"] = compute_med(all_times);
+  state.counters["99%"] = compute_high(all_times);
 }
-
-constexpr auto compute_low = [](const std::vector<double>& vv) -> double {
-  auto v = vv;
-  std::nth_element(v.begin(), v.end(), v.begin() + v.size()/100);
-  return v[v.size()/100];
-};
-
-constexpr auto compute_high = [](const std::vector<double>& vv) -> double {
-  auto v = vv;
-  std::nth_element(v.begin(), v.end(), v.begin() + v.size()*99/100);
-  return v[v.size()*99/100];
-};
 
 #define SETUP_BENCHMARK(bench)                    \
   BENCHMARK(bench)                                \
     ->Threads(1)                                  \
-    ->UseManualTime()                             \
-    ->ComputeStatistics("low", compute_low)       \
-    ->ComputeStatistics("high", compute_high);
+    ->UseManualTime();
 
 #define BENCH_PTR(atomic_sp, sp)                          \
   SETUP_BENCHMARK((bench_load<atomic_sp, sp>));           \
