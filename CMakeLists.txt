@@ -54,8 +54,8 @@ target_link_libraries(parlay_atomic_shared_ptr INTERFACE Threads::Threads)
 #  add_subdirectory(${folly_SOURCE_DIR} ${folly_BINARY_DIR})
 #endif()
 
-#find_package(folly REQUIRED)
-#target_link_libraries(parlay_atomic_shared_ptr INTERFACE folly fmt)
+find_package(folly REQUIRED)
+target_link_libraries(parlay_atomic_shared_ptr INTERFACE folly glog dl pthread double-conversion fmt gflags)
 
 # -------------------------------------------------------------------
 #                         Unit tests
@@ -90,3 +90,29 @@ message(STATUS "testing: Enabled")
 include(CTest)
 add_subdirectory(test)
 
+# -------------------------------------------------------------------
+#                       Benchmarks
+
+message(STATUS "---------------------------------- Benchmarks ----------------------------------")
+
+# Benchmark should not run its own unit tests
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+
+# Download Benchmark library
+include(FetchContent)
+FetchContent_Declare(benchmark
+  GIT_REPOSITORY  https://github.com/google/benchmark.git
+  GIT_TAG         main
+)
+FetchContent_GetProperties(benchmark)
+if(NOT benchmark_POPULATED)
+  message(STATUS "benchmarks: Configuring Google Benchmark")
+  FetchContent_Populate(benchmark)
+  set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1 CACHE BOOL "")
+  add_subdirectory(${benchmark_SOURCE_DIR}
+          ${benchmark_BINARY_DIR}
+          EXCLUDE_FROM_ALL)
+endif()
+
+add_subdirectory(benchmark)

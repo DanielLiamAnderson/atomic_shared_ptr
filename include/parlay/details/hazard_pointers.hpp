@@ -8,6 +8,10 @@
 #include <type_traits>
 #include <unordered_set>
 
+#include <folly/synchronization/AsymmetricThreadFence.h>
+
+#include <folly/container/F14Set.h>
+
 
 // PARLAY_PREFETCH: Prefetch data into cache
 #if defined(__GNUC__)
@@ -36,8 +40,9 @@ inline constexpr std::size_t CACHE_LINE_ALIGNMENT = 64;
 
 // Base class for control blocks protected by hazard pointers
 struct GarbageBase {
-  virtual GarbageBase*& get_next() = 0;
+  GarbageBase*& get_next() { return next_; }
   virtual void destroy() = 0;
+  GarbageBase* next_;
 };
 
 class HazardList;
@@ -86,6 +91,7 @@ class HazardList {
       while (head && !is_protected(head)) {
         garbage_type* old = std::exchange(head, head->get_next());
         old->destroy();
+        size--;
       }
       
       if (head) {
@@ -96,6 +102,7 @@ class HazardList {
             prev->get_next() = current->get_next();
             current->destroy();
             current = prev->get_next();
+            size--;
           }
           else {
             prev = std::exchange(current, current->get_next());
@@ -193,15 +200,22 @@ class HazardList {
   template<template<typename> typename Atomic, typename U, typename F>
   U protect(const Atomic<U>& src, F&& f) {
     static_assert(std::is_convertible_v<std::invoke_result_t<F, U>, garbage_type*>);
-    
-    U result;
     auto& slot = thread_manager.my_slot->protected_ptr;
-    
-    do {
-      result = src.load();
-      PARLAY_PREFETCH(result, 0, 0);
-      slot.store(f(result));
-    } while (src.load() != result);
+
+    U result = src.load(std::memory_order_relaxed);
+
+    while (true) {
+      PARLAY_PREFETCH(f(result), 0, 0);
+      slot.store(f(result), std::memory_order_relaxed);
+      folly::asymmetric_thread_fence_light(std::memory_order_seq_cst);    /*  Fast-side fence  */
+      U current_value = src.load(std::memory_order_acquire);
+      if (current_value == result) [[likely]] {
+        return result;
+      }
+      else {
+        result = std::move(current_value);
+      }
+    }
     
     return result;
   }
@@ -216,18 +230,23 @@ class HazardList {
   }
 
   void retire(garbage_type* p) noexcept {
-    RetiredList& my_list = thread_manager.my_slot->retired;
-    my_list.push(p);
+    RetiredList& retired_list = thread_manager.my_slot->retired;
+    retired_list.push(p);
     
-    if (my_list.get_size() >= cleanup_threshold) {
-      std::unordered_set<garbage_type*> protected_blocks;
-      scan_hazard_pointers([&](garbage_type* p) {
-        protected_blocks.insert(p);
-      });
-      my_list.cleanup([&](garbage_type* p) {
-        return protected_blocks.count(p) > 0;
-      });
+    if (retired_list.get_size() >= cleanup_threshold) [[unlikely]] {
+      cleanup(retired_list);
     }
+  }
+
+  void cleanup(RetiredList& retired_list) {
+    folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
+    folly::F14FastSet<garbage_type*> protected_blocks;
+    scan_hazard_pointers([&](garbage_type* p) {
+      protected_blocks.insert(p);
+    });
+    retired_list.cleanup([&](garbage_type* p) {
+      return protected_blocks.count(p) > 0;
+    });
   }
 
  private:

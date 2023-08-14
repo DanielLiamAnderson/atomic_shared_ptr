@@ -2,8 +2,9 @@
 
 // It tries to closely match the standard library std::shared_ptr as much as possible. Most 
 // of the code roughly follows the same implementation strategies as libstdc++, libc++, and
-// Microsoft STL.  The main difference is using deferred reclaimation on the control block
-// to allow atomic_shared_ptr to be lock free and not require a split reference count.
+// Microsoft STL.  The main difference is using Hazard Pointer deferred reclaimation on the
+// control block to allow atomic_shared_ptr to be lock free and not require a split reference
+// count.
 //
 // No support for std::shared_ptr<T[]>, i.e., shared pointers of arrays. They should not exist.
 //
@@ -61,24 +62,14 @@ struct control_block_base : public GarbageBase {
   // Increment the strong reference count.  The strong reference count must not be zero
   void increment_strong_count() noexcept {
     assert(strong_count.load(std::memory_order_relaxed) > 0);
-    //strong_count.fetch_add(1, std::memory_order_relaxed);
-    strong_count.increment(1, std::memory_order_relaxed);
+    [[maybe_unused]] auto success = strong_count.increment(1, std::memory_order_relaxed);
+    assert(success);
   }
   
   // Increment the strong reference count if it is not zero. Return true if successful,
   // otherwise return false indicating that the strong reference count is zero.
   bool increment_strong_count_if_nonzero() noexcept {
     return strong_count.increment(1, std::memory_order_relaxed);
-    /*
-    auto current = strong_count.load(std::memory_order_relaxed);
-    while (current != 0) {
-      if (strong_count.compare_exchange_strong(current, current + 1,
-          std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        return true;
-      }
-    }
-    return false;
-     */
   }
   
   // Release a strong reference to the object. If the strong reference count hits zero,
@@ -90,8 +81,6 @@ struct control_block_base : public GarbageBase {
     // https://www.boost.org/doc/libs/1_57_0/doc/html/atomic/usage_examples.html
     // Alternatively, an acquire-release decrement would work, but might be less efficient
     // since the acquire is only relevant if the decrement zeros the counter.
-
-    //if (strong_count.fetch_sub(1, std::memory_order_release) == 1) {
     if (strong_count.decrement(1, std::memory_order_release)) {
       std::atomic_thread_fence(std::memory_order_acquire);
       
@@ -143,9 +132,9 @@ struct control_block_inplace_base : public control_block_base {
     return static_cast<void*>(get());
   }
   
-  GarbageBase*& get_next() noexcept override {
-    return next;
-  }
+  //GarbageBase*& get_next() noexcept override {
+  //  return next;
+  //}
   
   // Store the object inside a union so we get precice control over its lifetime
   union {
@@ -231,9 +220,9 @@ struct control_block_with_ptr : public control_block_base {
     return static_cast<void*>(ptr);
   }
   
-  GarbageBase*& get_next() noexcept override {
-    return next;
-  }
+  //GarbageBase*& get_next() noexcept override {
+  //  return next;
+  //}
   
   union {
     T* ptr;
@@ -586,7 +575,23 @@ class shared_ptr : public details::smart_ptr_base<T> {
   void reset() noexcept {
     shared_ptr().swap(*this);
   }
-  
+
+  void reset(std::nullptr_t) noexcept {
+    shared_ptr().swap(*this);
+  }
+
+  template<typename Deleter>
+    requires std::copy_constructible<Deleter> && std::invocable<Deleter&, std::nullptr_t>
+  void reset(std::nullptr_t, Deleter deleter) {
+    shared_ptr(nullptr, deleter).swap(*this);
+  }
+
+  template<typename Deleter, typename Allocator>
+    requires std::copy_constructible<Deleter> && std::invocable<Deleter&, std::nullptr_t>
+  void reset(std::nullptr_t, Deleter deleter, Allocator alloc) {
+    shared_ptr(nullptr, deleter, alloc).swap(*this);
+  }
+
   template<typename U>
     requires std::convertible_to<U*, T*>
   void reset(U* p) {
