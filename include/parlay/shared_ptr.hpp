@@ -100,12 +100,14 @@ struct control_block_base {
   // using hazard pointers in case there are in in-flight increments.
   void decrement_weak_count() noexcept {
     if (weak_count.fetch_sub(1, std::memory_order_release) == 1) {
-      auto& hazptr = get_hazard_list<control_block_base>();
+      auto& hazptr = *get_hazard_list<control_block_base>();
       hazptr.retire(this);
     }
   }
 
-  control_block_base*& get_next() noexcept { return next_; }
+  control_block_base* get_next() const noexcept { return next_; }
+  void set_next(control_block_base* next) noexcept { next_ = next; }
+
   void* get_ptr() const noexcept { return const_cast<void*>(ptr); }
 
   auto get_use_count() const noexcept { return strong_count.load(std::memory_order_relaxed); }
@@ -119,7 +121,7 @@ struct control_block_base {
   std::atomic<ref_cnt_type> weak_count;
 
   union {
-    control_block_base* next_;     // Used for garbage collection by Hazard pointers
+    control_block_base* next_;     // Intrusive ptr used for garbage collection by Hazard pointers
     void* ptr;                     // Pointer to the managed object while it is alive
   };
 };
@@ -226,7 +228,7 @@ struct control_block_with_ptr : public control_block_base {
   }
 };
 
-// A control block pointering to a dynamically allocated object with a custom deleter
+// A control block pointing to a dynamically allocated object with a custom deleter
 template<typename T, typename Deleter>
 struct control_block_with_deleter : public control_block_with_ptr<T> {
   
@@ -255,7 +257,7 @@ struct control_block_with_deleter : public control_block_with_ptr<T> {
 };
 
 
-// A control block pointering to a dynamically allocated object with a custom deleter and custom allocator
+// A control block pointing to a dynamically allocated object with a custom deleter and custom allocator
 template<typename T, typename Deleter, typename Allocator>
 struct control_block_with_allocator final : public control_block_with_deleter<T, Deleter> {
 

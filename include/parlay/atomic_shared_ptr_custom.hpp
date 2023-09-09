@@ -18,8 +18,8 @@ class atomic_shared_ptr {
   
  public:
   
-  atomic_shared_ptr() noexcept = default;
-  atomic_shared_ptr(std::nullptr_t) noexcept : control_block{nullptr} { }
+  constexpr atomic_shared_ptr() noexcept = default;
+  constexpr atomic_shared_ptr(std::nullptr_t) noexcept : control_block{nullptr} { }
   
   atomic_shared_ptr(shared_ptr_type desired) {
     auto [ptr_, control_block_] = desired.release_internals();
@@ -40,7 +40,7 @@ class atomic_shared_ptr {
   [[nodiscard]] shared_ptr_type load([[maybe_unused]] std::memory_order order = std::memory_order_seq_cst) const {
     control_block_type* current_control_block = nullptr;
     
-    auto& hazptr = get_hazard_list<control_block_type>();
+    auto& hazptr = *get_hazard_list<control_block_type>();
     
     while (true) {
       current_control_block = hazptr.protect(control_block);
@@ -78,7 +78,7 @@ class atomic_shared_ptr {
         return true;
       }
       else {
-        expected = load();   // Its possible that expected ABAs and stays the same on failure, hence
+        expected = load();   // It's possible that expected ABAs and stays the same on failure, hence
         return false;        // why this algorithm can not be used to implement compare_exchange_strong
       }
   }
