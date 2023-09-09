@@ -10,6 +10,13 @@
 
 #include <folly/concurrency/AtomicSharedPtr.h>
 
+#include "external/anthonywilliams/atomic_shared_ptr"
+#include "external/vtyulb/atomic_shared_ptr.h"
+
+#ifdef JUST_THREADS_AVAILABLE
+#include <experimental/atomic>
+#endif
+
 #include "parlay/atomic_shared_ptr_custom.hpp"
 
 #ifdef __cpp_lib_atomic_shared_ptr
@@ -54,15 +61,11 @@ constexpr auto compute_high = [](std::vector<double>& v) -> double {
   return v[v.size()*99/100];
 };
 
-template<typename T, typename... Args>
-inline extern T& get_singleton(Args&&... args) {
-  static T t(std::forward<Args>(args)...);
-  return t;
-}
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
 static void bench_load(benchmark::State& state) {
-  AtomicSharedPtr<int>& src = get_singleton<AtomicSharedPtr<int>>(SharedPtr<int>(new int(42)));
+  AtomicSharedPtr<int> src;
+  src.store(SharedPtr<int>(new int(42)));
 
   std::vector<double> all_times;
 
@@ -83,7 +86,8 @@ static void bench_load(benchmark::State& state) {
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
 static void bench_store_delete(benchmark::State& state) {
-  AtomicSharedPtr<int>& src = get_singleton<AtomicSharedPtr<int>>(SharedPtr<int>(new int(42)));
+  AtomicSharedPtr<int> src;
+  src.store(SharedPtr<int>(new int(42)));
 
   std::vector<double> all_times;
 
@@ -107,7 +111,8 @@ static void bench_store_delete(benchmark::State& state) {
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
 static void bench_store_copy(benchmark::State& state) {
-  AtomicSharedPtr<int>& src = get_singleton<AtomicSharedPtr<int>>(SharedPtr<int>(new int(42)));
+  AtomicSharedPtr<int> src;
+  src.store(SharedPtr<int>(new int(42)));
 
   auto my_sp = SharedPtr<int>(new int(42));
 
@@ -132,16 +137,25 @@ static void bench_store_copy(benchmark::State& state) {
   state.counters["99%"] = compute_high(all_times);
 }
 
-#define SETUP_BENCHMARK(bench)                    \
-  BENCHMARK(bench)                                \
-    ->Threads(1)                                  \
+
+
+#define SETUP_BENCHMARK(ptr_name, bench_name, bench)       \
+  BENCHMARK(bench)                                         \
+    ->Name(ptr_name "::" bench_name)                       \
     ->UseManualTime();
 
-#define BENCH_PTR(atomic_sp, sp)                          \
-  SETUP_BENCHMARK((bench_load<atomic_sp, sp>));           \
-  SETUP_BENCHMARK((bench_store_delete<atomic_sp, sp>));   \
-  SETUP_BENCHMARK((bench_store_copy<atomic_sp, sp>));
+#define BENCH_PTR(name, atomic_sp, sp)                                        \
+  SETUP_BENCHMARK(name, "load", (bench_load<atomic_sp, sp>));                 \
+  SETUP_BENCHMARK(name, "store", (bench_store_copy<atomic_sp, sp>));          \
+  SETUP_BENCHMARK(name, "store-del", (bench_store_delete<atomic_sp, sp>));
 
-BENCH_PTR(StlAtomicSharedPtr, std::shared_ptr);
-BENCH_PTR(folly::atomic_shared_ptr, std::shared_ptr);
-BENCH_PTR(parlay::atomic_shared_ptr, parlay::shared_ptr);
+
+BENCH_PTR("STL", StlAtomicSharedPtr, std::shared_ptr);
+BENCH_PTR("Folly", folly::atomic_shared_ptr, std::shared_ptr);
+BENCH_PTR("Mine", parlay::atomic_shared_ptr, parlay::shared_ptr);
+BENCH_PTR("JSS-Free", jss::atomic_shared_ptr, jss::shared_ptr);
+BENCH_PTR("Vtyulb", LFStructs::AtomicSharedPtr, LFStructs::SharedPtr);
+
+#ifdef JUST_THREADS_AVAILABLE
+BENCH_PTR("JSS", std::experimental::atomic_shared_ptr, std::experimental::shared_ptr);
+#endif

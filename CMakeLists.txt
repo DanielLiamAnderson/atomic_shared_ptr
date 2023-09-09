@@ -40,22 +40,31 @@ target_compile_features(parlay_atomic_shared_ptr INTERFACE cxx_std_20)
 find_package(Threads REQUIRED)
 target_link_libraries(parlay_atomic_shared_ptr INTERFACE Threads::Threads)
 
+# We use boost::atomic for DWCAS
+find_package(Boost COMPONENTS atomic)
+target_link_libraries(parlay_atomic_shared_ptr INTERFACE Boost::atomic)
 
-# -------------------------------------------------------------------
-#                             Folly
-
-#FetchContent_Declare(folly
-#  GIT_REPOSITORY https://github.com/facebook/folly
-#  GIT_TAG main
-#)
-
-#if(NOT folly_POPULATED)
-#  FetchContent_Populate(folly)
-#  add_subdirectory(${folly_SOURCE_DIR} ${folly_BINARY_DIR})
-#endif()
-
+# We use Folly utilities such as heavy/light fences and compare against their atomic_shared_ptr
 find_package(folly REQUIRED)
-target_link_libraries(parlay_atomic_shared_ptr INTERFACE folly glog dl pthread double-conversion fmt gflags)
+target_link_libraries(parlay_atomic_shared_ptr INTERFACE folly glog dl double-conversion fmt gflags)
+
+# Configure just::threads (Anthony William's commercial library with a lock-free atomic_shared_ptr)
+# if available.  We will perform benchmarks against it if it is installed, otherwise we skip it
+find_library(JUST_THREADS_LIB NAMES justthread)
+find_path(JUST_THREADS_INCLUDE NAMES jss/experimental_concurrency.hpp PATH_SUFFIXES justthread)
+if(NOT JUST_THREADS_LIB)
+  message(STATUS "Could not find just::threads library. Benchmarks against it will be omitted")
+elseif(NOT JUST_THREADS_INCLUDE)
+  message(STATUS "Could not find just::threads includes. Benchmarks against it will be omitted")
+else()
+  message(STATUS "just::threads found -- lib: " ${JUST_THREADS_LIB} " include: " ${JUST_THREADS_INCLUDE})
+  set(JUST_THREADS_AVAILABLE TRUE)
+  add_library(jss INTERFACE)
+  target_include_directories(jss INTERFACE ${JUST_THREADS_INCLUDE})
+  target_link_libraries(jss INTERFACE ${JUST_THREADS_LIB} atomic)
+  target_compile_definitions(parlay_atomic_shared_ptr INTERFACE -DJUST_THREADS_AVAILABLE)
+  target_link_libraries(parlay_atomic_shared_ptr INTERFACE jss)
+endif()
 
 # -------------------------------------------------------------------
 #                         Unit tests

@@ -72,7 +72,7 @@ class HazardList {
   // - a control block contains an inline-allocated object, which will have been
   //   destroyed by the time the control block is retired, so we stick the next
   //   pointer inside its leftover storage.
-  struct alignas(CACHE_LINE_ALIGNMENT) RetiredList {
+  struct RetiredList {
     
     constexpr RetiredList() noexcept = default;
     
@@ -266,4 +266,3 @@ HazardList<GarbageType>& get_hazard_list() {
   static HazardList<GarbageType> list;
   return list;
 }
-
