@@ -33,7 +33,7 @@ using StlAtomicSharedPtr = std::atomic<std::shared_ptr<T>>;
 template<typename T>
 struct StlAtomicSharedPtr {
   StlAtomicSharedPtr() = default;
-  StlAtomicSharedPtr(std::shared_ptr<T> other) : sp(std::move(other)) { }
+  explicit(false) StlAtomicSharedPtr(std::shared_ptr<T> other) : sp(std::move(other)) { }   // NOLINT
   std::shared_ptr<T> load() { return std::atomic_load(&sp); }
   void store(std::shared_ptr<T> r) { std::atomic_store(&sp, std::move(r)); }
   bool compare_exchange_strong(std::shared_ptr<T>& expected, std::shared_ptr<T> desired) {
