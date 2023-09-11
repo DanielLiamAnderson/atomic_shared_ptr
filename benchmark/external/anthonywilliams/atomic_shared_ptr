@@ -88,8 +88,8 @@ struct shared_ptr_header_block_base{
 
     static unsigned const cast_pointer_count=3;
     struct ptr_extension_block{
-        boost::atomic<void*> cast_pointers[cast_pointer_count];
-        boost::atomic<ptr_extension_block*> cp_extension;
+        std::atomic<void*> cast_pointers[cast_pointer_count];
+        std::atomic<ptr_extension_block*> cp_extension;
 
         ptr_extension_block():
             cp_extension(0)
@@ -139,13 +139,13 @@ struct shared_ptr_header_block_base{
         
     };
 
-    boost::atomic<counter> count;
-    boost::atomic<unsigned> weak_count;
+    std::atomic<counter> count;
+    std::atomic<unsigned> weak_count;
     ptr_extension_block cp_extension;
 
     unsigned use_count()
     {
-        counter c=count.load(boost::memory_order_relaxed);
+        counter c=count.load(std::memory_order_relaxed);
         return c.count+(c.external_counters?1:0);
     }
 
@@ -189,7 +189,7 @@ struct shared_ptr_header_block_base{
 
     void dec_count()
     {
-        counter old=count.load(boost::memory_order_relaxed);
+        counter old=count.load(std::memory_order_relaxed);
         for(;;){
             counter new_count=old;
             --new_count.count;
@@ -203,7 +203,7 @@ struct shared_ptr_header_block_base{
 
     bool shared_from_weak()
     {
-        counter old=count.load(boost::memory_order_relaxed);
+        counter old=count.load(std::memory_order_relaxed);
         while(old.count||old.external_counters){
             counter new_count=old;
             ++new_count.count;
@@ -215,7 +215,7 @@ struct shared_ptr_header_block_base{
 
     void inc_count()
     {
-        counter old=count.load(boost::memory_order_relaxed);
+        counter old=count.load(std::memory_order_relaxed);
         for(;;){
             counter new_count=old;
             ++new_count.count;
@@ -226,7 +226,7 @@ struct shared_ptr_header_block_base{
     
     void add_external_counters(unsigned external_count)
     {
-        counter old=count.load(boost::memory_order_relaxed);
+        counter old=count.load(std::memory_order_relaxed);
         for(;;){
             counter new_count=old;
             new_count.external_counters+=external_count;
@@ -237,7 +237,7 @@ struct shared_ptr_header_block_base{
 
     void remove_external_counter()
     {
-        counter old=count.load(boost::memory_order_relaxed);
+        counter old=count.load(std::memory_order_relaxed);
         for(;;){
             counter new_count=old;
             --new_count.external_counters;

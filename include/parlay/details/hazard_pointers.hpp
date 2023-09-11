@@ -12,6 +12,8 @@
 
 #include <folly/container/F14Set.h>
 
+#include "immortal.hpp"
+
 namespace parlay {
 
 // PARLAY_PREFETCH: Prefetch data into cache
@@ -40,25 +42,40 @@ inline constexpr std::size_t CACHE_LINE_ALIGNMENT = 128;
 
 
 template<typename T>
-concept GarbageCollectible = requires(T t, T *tp) {
-  { t.get_next() } -> std::convertible_to<T *>;     // The object should expose an intrusive next ptr
-  { t.set_next(tp) };
-  { t.destroy() };                                 // The object should be destructible on demand
+concept GarbageCollectible = requires(T* t, T* tp) {
+  { t->get_next() } -> std::convertible_to<T*>;     // The object should expose an intrusive next ptr
+  { t->set_next(tp) };
+  { t->destroy() };                                 // The object should be destructible on demand
 };
 
 template<typename GarbageType> requires GarbageCollectible<GarbageType>
-class HazardList;
+class HazardPointers;
 
 template<typename GarbageType>
-extern inline HazardList<GarbageType> *get_hazard_list();
+extern inline HazardPointers<GarbageType>& get_hazard_list();
 
+// A simple and efficient implementation of Hazard Pointer deferred reclamation
+//
+// Each live thread owns *exactly one* Hazard Pointer, which is sufficient for most
+// (but not all) algorithms that use them. In particular, it is sufficient for lock-
+// free atomic shared ptrs. This makes it much simpler and slightly more efficient
+// than a general-purpose Hazard Pointer implementation, like the one in Folly, which
+// supports each thread having an arbitrary number of Hazard Pointers.
+//
+// Each thread keeps a local retired list of objects that are pending deletion.
+// This means that a stalled thread can delay the destruction of its retired objects
+// indefinitely, however, since each thread is only allowed to protect a single object
+// at a time, it is guaranteed that there are at most O(P^2) total unreclaimed objects
+// at any given point, so the memory usage is theoretically bounded.
 template<typename GarbageType> requires GarbageCollectible<GarbageType>
-class HazardList {
+class HazardPointers {
 
+  // After this many retires, a thread will attempt to clean up the contents of
+  // its local retired list, deleting any retired objects that are not protected.
   constexpr static std::size_t cleanup_threshold = 1000;
 
   using garbage_type = GarbageType;
-  using protected_set_type = folly::F14FastSet<garbage_type *>;
+  using protected_set_type = folly::F14FastSet<garbage_type*>;
 
   // The retired list is an intrusive linked list of retired blocks. It takes advantage
   // of the available managed object pointer in the control block to store the next pointers.
@@ -71,10 +88,10 @@ class HazardList {
     constexpr RetiredList() noexcept = default;
 
     ~RetiredList() {
-      cleanup([](auto &&) { return false; });
+      cleanup([](auto&&) { return false; });
     }
 
-    void push(garbage_type *p) noexcept {
+    void push(garbage_type* p) noexcept {
       p->set_next(std::exchange(head, p));
       size++;
     }
@@ -96,11 +113,11 @@ class HazardList {
       }
 
       if (head) {
-        garbage_type *prev = head;
+        garbage_type* prev = head;
         garbage_type *current = head->get_next();
         while (current) {
           if (!is_protected(current)) {
-            garbage_type *old = std::exchange(current, current->get_next());
+            garbage_type* old = std::exchange(current, current->get_next());
             old->destroy();
             prev->set_next(current);
             size--;
@@ -112,7 +129,7 @@ class HazardList {
     }
 
   private:
-    garbage_type *head = nullptr;
+    garbage_type* head = nullptr;
     std::size_t size = 0;
   };
 
@@ -127,10 +144,10 @@ class HazardList {
 
     // The *actual* "Hazard Pointer" that protects the object that it points to.
     // Other threads scan for the set of all such pointers before they clean up.
-    std::atomic<garbage_type *> protected_ptr{nullptr};
+    std::atomic<garbage_type*> protected_ptr{nullptr};
 
     // Link together all existing slots into a big global linked list
-    std::atomic<HazardSlot *> next{nullptr};
+    std::atomic<HazardSlot*> next{nullptr};
 
     // True if a thread owns this slot, else false.
     std::atomic<bool> in_use;
@@ -146,25 +163,16 @@ class HazardList {
     protected_set_type protected_set{2 * std::thread::hardware_concurrency()};
   };
 
-  // Pre-populate the slot list with P slots, one for each hardware thread
-  HazardList() : global_list_head(new HazardSlot{false}) {
-    auto current = global_list_head;
-    for (unsigned i = 1; i < std::thread::hardware_concurrency(); i++) {
-      current->next = new HazardSlot{false};
-      current = current->next;
-    }
-  }
-
   // Find an available hazard slot, or allocate a new one if none available.
   HazardSlot *get_slot() {
-    auto current = global_list_head;
+    auto current = list_head;
     while (true) {
       if (!current->in_use.load() && !current->in_use.exchange(true)) {
         return current;
       }
       if (current->next.load() == nullptr) {
         auto my_slot = new HazardSlot{true};
-        HazardSlot *next = nullptr;
+        HazardSlot* next = nullptr;
         while (!current->next.compare_exchange_weak(next, my_slot)) {
           current = next;
           next = nullptr;
@@ -177,7 +185,7 @@ class HazardList {
   }
 
   // Give a slot back to the world so another thread can re-use it
-  void relinquish_slot(HazardSlot *slot) {
+  void relinquish_slot(HazardSlot* slot) {
     slot->in_use.store(false);
   }
 
@@ -186,27 +194,41 @@ class HazardList {
   // a new slot if all of them are in use.  On destruction, it makes the slot available
   // for another thread to pick up.
   struct HazardSlotOwner {
-    explicit HazardSlotOwner(HazardList<GarbageType> *list_) : list(list_), my_slot(list->get_slot()) {}
+    explicit HazardSlotOwner(HazardPointers<GarbageType>& list_) : list(list_), my_slot(list.get_slot()) {}
 
     ~HazardSlotOwner() {
-      list->relinquish_slot(my_slot);
+      list.relinquish_slot(my_slot);
     }
 
   private:
-    HazardList<GarbageType> *const list;
+    HazardPointers<GarbageType>& list;
   public:
-    HazardSlot *const my_slot;
+    HazardSlot* const my_slot;
   };
 
 public:
 
-  // Leak on purpose since we don't want static destruction order to ruin our day
-  ~HazardList() = delete;
+  // Pre-populate the slot list with P slots, one for each hardware thread
+  HazardPointers() : list_head(new HazardSlot{false}) {
+    auto current = list_head;
+    for (unsigned i = 1; i < std::thread::hardware_concurrency(); i++) {
+      current->next = new HazardSlot{false};
+      current = current->next;
+    }
+  }
+
+  ~HazardPointers() {
+    auto current = list_head;
+    while (current) {
+      auto old = std::exchange(current, current->next.load());
+      delete old;
+    }
+  }
 
   // Apply the function f to all currently announced hazard pointers
   template<typename F>
-  void scan_hazard_pointers(F &&f) noexcept(std::is_nothrow_invocable_v<F &, garbage_type *>) {
-    auto current = global_list_head;
+  void scan_hazard_pointers(F &&f) noexcept(std::is_nothrow_invocable_v<F &, garbage_type*>) {
+    auto current = list_head;
     while (current) {
       auto p = current->protected_ptr.load();
       if (p) {
@@ -224,7 +246,7 @@ public:
   // f(ptr) is protected instead, but the full value *ptr is still returned.
   template<template<typename> typename Atomic, typename U, typename F>
   U protect(const Atomic<U> &src, F &&f) {
-    static_assert(std::is_convertible_v<std::invoke_result_t<F, U>, garbage_type *>);
+    static_assert(std::is_convertible_v<std::invoke_result_t<F, U>, garbage_type*>);
     auto &slot = local_slot.my_slot->protected_ptr;
 
     U result = src.load(std::memory_order_relaxed);
@@ -256,8 +278,8 @@ public:
   // Retire the given object
   //
   // The object managed by p must have reference count zero.
-  void retire(garbage_type *p) noexcept {
-    RetiredList &retired_list = local_slot.my_slot->retired;
+  void retire(garbage_type* p) noexcept {
+    RetiredList& retired_list = local_slot.my_slot->retired;
     retired_list.push(p);
 
     if (retired_list.get_size() >= cleanup_threshold) [[unlikely]] {
@@ -268,34 +290,36 @@ public:
   FOLLY_NOINLINE void cleanup(RetiredList &retired_list, protected_set_type &protected_set) {
     folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
 
-    scan_hazard_pointers([&](garbage_type *p) {
+    scan_hazard_pointers([&](garbage_type* p) {
       protected_set.insert(p);
     });
-    retired_list.cleanup([&](garbage_type *p) {
+    retired_list.cleanup([&](garbage_type* p) {
       return protected_set.count(p) > 0;
     });
 
-    protected_set.clear();  // Does not free memory, only clears contents
+    protected_set.clear();    // Does not free memory, only clears contents
   }
 
 private:
-  template<typename U>
-  friend HazardList<U> *get_hazard_list();
-
-  HazardSlot *const global_list_head;
+  HazardSlot* const list_head;
   static inline const thread_local HazardSlotOwner local_slot{get_hazard_list<garbage_type>()};
 };
 
 
-// Global singleton containing the list of hazard pointers.  We leak it on
-// purpose to avoid falling victim to the woes of static destruction order
+// Global singleton containing the list of hazard pointers.  Wrapping it
+// inside an Immortal means it is never destroyed, even at termination.
 //
 // (i.e., a detached thread might grab a HazardSlot entry and not relinquish
 // it until static destruction, at which point this global static would have
-// already been destroyed.)
+// already been destroyed. We avoid that using this pattern.)
+//
+// This does technically mean that we leak the HazardSlots, but that is
+// a price we are willing to pay.
 template<typename GarbageType>
-HazardList<GarbageType> *get_hazard_list() {
-  static auto *list = new HazardList<GarbageType>{};
+HazardPointers<GarbageType>& get_hazard_list() {
+  static_assert(std::is_trivially_destructible_v<detail::Immortal<HazardPointers<GarbageType>>>);
+
+  static detail::Immortal<HazardPointers<GarbageType>> list;
   return list;
 }
 

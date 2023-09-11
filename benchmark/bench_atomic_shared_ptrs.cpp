@@ -19,6 +19,8 @@
 
 #include "parlay/atomic_shared_ptr_custom.hpp"
 
+#include "parlay/basic_atomic_shared_ptr.hpp"
+
 #ifdef __cpp_lib_atomic_shared_ptr
 
 // C++ standard library atomic support for shared ptrs
@@ -155,6 +157,7 @@ BENCH_PTR("Folly", folly::atomic_shared_ptr, std::shared_ptr);
 BENCH_PTR("Mine", parlay::atomic_shared_ptr, parlay::shared_ptr);
 BENCH_PTR("JSS-Free", jss::atomic_shared_ptr, jss::shared_ptr);
 BENCH_PTR("Vtyulb", LFStructs::AtomicSharedPtr, LFStructs::SharedPtr);
+BENCH_PTR("Mine-basic", parlay::basic::atomic_shared_ptr, parlay::basic::shared_ptr);
 
 #ifdef JUST_THREADS_AVAILABLE
 BENCH_PTR("JSS", std::experimental::atomic_shared_ptr, std::experimental::shared_ptr);

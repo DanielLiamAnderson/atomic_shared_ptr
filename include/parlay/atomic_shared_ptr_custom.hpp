@@ -19,9 +19,10 @@ class atomic_shared_ptr {
  public:
   
   constexpr atomic_shared_ptr() noexcept = default;
-  constexpr atomic_shared_ptr(std::nullptr_t) noexcept : control_block{nullptr} { }
+  constexpr explicit(false) atomic_shared_ptr(std::nullptr_t) noexcept    // NOLINT(google-explicit-constructor)
+    : control_block{nullptr} { }
   
-  atomic_shared_ptr(shared_ptr_type desired) {
+  explicit(false) atomic_shared_ptr(shared_ptr_type desired) {            // NOLINT(google-explicit-constructor)
     auto [ptr_, control_block_] = desired.release_internals();
     control_block.store(control_block_, std::memory_order_relaxed);
   }
@@ -40,7 +41,7 @@ class atomic_shared_ptr {
   [[nodiscard]] shared_ptr_type load([[maybe_unused]] std::memory_order order = std::memory_order_seq_cst) const {
     control_block_type* current_control_block = nullptr;
     
-    auto& hazptr = *get_hazard_list<control_block_type>();
+    auto& hazptr = get_hazard_list<control_block_type>();
     
     while (true) {
       current_control_block = hazptr.protect(control_block);

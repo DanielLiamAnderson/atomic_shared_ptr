@@ -16,5 +16,8 @@ function(add_my_test TARGET)
   message(STATUS "Added test target " ${TARGET})
 endfunction()
 
+add_my_test(test_basic_shared_ptr)
+add_my_test(test_basic_atomic_shared_ptr)
+
 add_my_test(test_shared_ptr)
 add_my_test(test_atomic_shared_ptr_custom)

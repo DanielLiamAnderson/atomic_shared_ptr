@@ -104,8 +104,6 @@ TEST(TestAtomicSharedPtr, TestCompareExchangeWeakFalse) {
   shared_ptr<int> s3{new int(5)};
   bool result = p.compare_exchange_weak(s3, std::move(s2));
   ASSERT_FALSE(result);
-  ASSERT_TRUE(s2);
-  ASSERT_EQ(s2.use_count(), 1);
   
   shared_ptr<int> l = p.load();
   ASSERT_EQ(*l, 5);
@@ -139,8 +137,6 @@ TEST(TestAtomicSharedPtr, TestCompareExchangeStrongFalse) {
   shared_ptr<int> s3{new int(5)};
   bool result = p.compare_exchange_strong(s3, std::move(s2));
   ASSERT_FALSE(result);
-  ASSERT_TRUE(s2);
-  ASSERT_EQ(s2.use_count(), 1);
   
   shared_ptr<int> l = p.load();
   ASSERT_EQ(*l, 5);

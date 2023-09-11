@@ -1,18 +1,20 @@
-// A custom modern shared_ptr and weak_ptr implementation used by the atomic_shared_ptr.
+// A custom modernized C++20 shared_ptr and weak_ptr implementation used by the atomic_shared_ptr.
 
-// It tries to closely match the standard library std::shared_ptr as much as possible. Most 
-// of the code roughly follows the same implementation strategies as libstdc++, libc++, and
-// Microsoft STL.  The main difference is using Hazard Pointer deferred reclaimation on the
-// control block to allow atomic_shared_ptr to be lock free and not require a split reference
-// count.
+// It tries to closely match the standard library std::shared_ptr as much as possible. Most  of the
+// code roughly follows the same implementation strategies as libstdc++, libc++, and Microsoft STL.
 //
-// No support for std::shared_ptr<T[]>, i.e., shared pointers of arrays. They should not exist.
+// The main difference is using Hazard Pointer deferred reclaimation on the control block to
+// allow atomic_shared_ptr to be lock free and not require a split reference count.
+//
+// No support for std::shared_ptr<T[]>, i.e., shared pointers of arrays. Everything else should
+// be supported.
 //
 
 #pragma once
 
 #include <atomic>
 #include <memory>
+#include <variant>
 
 #include "details/hazard_pointers.hpp"
 #include "details/wait_free_counter.hpp"
@@ -28,13 +30,29 @@ class shared_ptr;
 template<typename T>
 class weak_ptr;
 
+template<typename T>
+class enable_shared_from_this;
+
+template<typename Deleter, typename T>
+Deleter* get_deleter(const shared_ptr<T>&) noexcept;
+
 namespace details {
 
+// Very useful explanation from Raymond Chen's blog:
+// https://devblogs.microsoft.com/oldnewthing/20230816-00/?p=108608
+template<typename T>
+concept SupportsESFT = requires() {
+  typename T::esft_detector;                                                    // Class should derive from ESFT
+  requires std::same_as<typename T::esft_detector, enable_shared_from_this<T>>;
+  requires std::convertible_to<T*, enable_shared_from_this<T>*>;                // Inheritance is unambiguous
+};
 
 using ref_cnt_type = uint32_t;
 
 
-// Base class of all control blocks used by smart pointers
+// Base class of all control blocks used by smart pointers.  This base class is agnostic
+// to the type of the managed object, so all type-specific operations are implemented
+// by virtual functions in the derived classes.
 struct control_block_base {
   
   template<typename T>
@@ -100,8 +118,8 @@ struct control_block_base {
   // using hazard pointers in case there are in in-flight increments.
   void decrement_weak_count() noexcept {
     if (weak_count.fetch_sub(1, std::memory_order_release) == 1) {
-      auto& hazptr = *get_hazard_list<control_block_base>();
-      hazptr.retire(this);
+      // Defer destruction of the control block using hazard pointers
+      get_hazard_list<control_block_base>().retire(this);
     }
   }
 
@@ -141,7 +159,7 @@ struct control_block_inplace_base : public control_block_base {
   // Store the object inside a union, so we get precise control over its lifetime
   union {
     T object;
-    char empty;
+    std::monostate empty;
   };
 };
 
@@ -178,7 +196,7 @@ struct control_block_inplace_allocator final : public control_block_inplace_base
   using cb_allocator_t = typename std::allocator_traits<Allocator>::template rebind_alloc<control_block_inplace_allocator>;
   using object_allocator_t = typename std::allocator_traits<Allocator>::template rebind_alloc<std::remove_cv_t<T>>;
 
-  control_block_inplace_allocator(Allocator alloc_, for_overwrite_tag) {
+  control_block_inplace_allocator(Allocator, for_overwrite_tag) {
     ::new(static_cast<void*>(this->get())) T;   // Default initialization when using make_shared_for_overwrite
     this->set_ptr(this->get());                 // Unfortunately not possible via the allocator since the C++
                                                 // standard forgot about this case, apparently.
@@ -299,8 +317,7 @@ class smart_ptr_base {
   [[nodiscard]] bool owner_before(const smart_ptr_base<T2>& other) const noexcept {
     return control_block < other.control_block;
   }
-  
-  smart_ptr_base(const smart_ptr_base&) = delete;
+
   smart_ptr_base& operator=(const smart_ptr_base&) = delete;
   
   [[nodiscard]] element_type* get() const noexcept {
@@ -311,7 +328,24 @@ class smart_ptr_base {
 
   constexpr smart_ptr_base() noexcept = default;
   
-  smart_ptr_base(element_type* ptr_, control_block_base* control_block_) noexcept : ptr(ptr_), control_block(control_block_)  { }
+  smart_ptr_base(element_type* ptr_, control_block_base* control_block_) noexcept
+      : ptr(ptr_), control_block(control_block_)  {
+    assert(control_block != nullptr || ptr == nullptr);   // Can't have non-null ptr and null control_block
+  }
+
+  template<typename T2>
+    requires std::convertible_to<T2*, T*>
+  explicit smart_ptr_base(const smart_ptr_base<T2>& other) noexcept
+      : ptr(other.ptr), control_block(other.control_block) {
+    assert(control_block != nullptr || ptr == nullptr);   // Can't have non-null ptr and null control_block
+  }
+
+  template<typename T2>
+    requires std::convertible_to<T2*, T*>
+  explicit smart_ptr_base(smart_ptr_base<T2>&& other) noexcept
+      : ptr(std::exchange(other.ptr, nullptr)), control_block(std::exchange(other.control_block, nullptr)) {
+    assert(control_block != nullptr || ptr == nullptr);   // Can't have non-null ptr and null control_block
+  }
   
   ~smart_ptr_base() = default;
   
@@ -327,10 +361,7 @@ class smart_ptr_base {
   }
   
   [[nodiscard]] bool increment_if_nonzero() const noexcept {
-    if (control_block) {
-      return control_block->increment_strong_count_if_nonzero();
-    }
-    return false;
+    return control_block && control_block->increment_strong_count_if_nonzero();
   }
   
   void decrement_strong() noexcept {
@@ -350,14 +381,9 @@ class smart_ptr_base {
       control_block->decrement_weak_count();
     }
   }
-  
-  void set_ptr_and_control_block(element_type* ptr_, control_block_base* control_block_) {
-    ptr = ptr_;
-    control_block = control_block_;
-  }
 
   template<typename Deleter, typename TT>
-  friend Deleter* get_deleter(const shared_ptr<TT>& sp) noexcept;
+  friend Deleter* ::parlay::get_deleter(const shared_ptr<TT>&) noexcept;
 
   element_type* ptr{nullptr};
   control_block_base* control_block{nullptr};
@@ -379,8 +405,8 @@ class shared_ptr : public details::smart_ptr_base<T> {
   template<typename T0>
   friend class weak_ptr;
   
-  // Private constructor used by atomic_shared_ptr::load
-  shared_ptr(T* ptr_, details::control_block_base* control_block_) : base(ptr_, control_block_) {}
+  // Private constructor used by atomic_shared_ptr::load and weak_ptr::lock
+  shared_ptr(T* ptr_, details::control_block_base* control_block_) : base(ptr_, control_block_) { }
   
  public:
   using typename base::element_type;
@@ -398,14 +424,14 @@ class shared_ptr : public details::smart_ptr_base<T> {
   
   constexpr shared_ptr() noexcept = default;
   
-  constexpr shared_ptr(std::nullptr_t) noexcept {}
+  constexpr explicit(false) shared_ptr(std::nullptr_t) noexcept {}      // NOLINT(google-explicit-constructor)
   
   template<typename U>
     requires std::convertible_to<U*, T*>
   explicit shared_ptr(U* p) {
     std::unique_ptr<U> up(p);     // Hold inside a unique_ptr so that p is deleted if the allocation throws
     auto control_block = new details::control_block_with_ptr<U>(p);
-    this->set_ptr_and_control_block(up.release(), control_block);
+    this->set_ptrs_and_esft(up.release(), control_block);
   }
   
   template<typename U, typename Deleter>
@@ -413,7 +439,7 @@ class shared_ptr : public details::smart_ptr_base<T> {
   shared_ptr(U* p, Deleter deleter) {
     std::unique_ptr<U, Deleter> up(p, deleter);
     auto control_block = new details::control_block_with_deleter<U, Deleter>(p, std::move(deleter));
-    this->set_ptr_and_control_block(up.release(), control_block);
+    this->set_ptrs_and_esft(up.release(), control_block);
   }
   
   template<typename U, typename Deleter, typename Allocator>
@@ -425,7 +451,7 @@ class shared_ptr : public details::smart_ptr_base<T> {
     cb_alloc_t a{alloc};
     auto control_block = std::allocator_traits<cb_alloc_t>::allocate(a, 1);
     std::allocator_traits<cb_alloc_t>::construct(a, control_block, p, std::move(deleter), a);
-    this->set_ptr_and_control_block(up.release(), control_block);
+    this->set_ptrs_and_esft(up.release(), control_block);
   }
   
   template<typename U, typename Deleter>
@@ -433,7 +459,7 @@ class shared_ptr : public details::smart_ptr_base<T> {
   shared_ptr(std::nullptr_t, Deleter deleter) {
     std::unique_ptr<U, Deleter> up(nullptr, deleter);
     auto control_block = new details::control_block_with_deleter<U, Deleter>(nullptr, std::move(deleter));
-    this->set_ptr_and_control_block(nullptr, control_block);
+    this->set_ptrs_and_esft(nullptr, control_block);
   }
   
   template<typename U, typename Deleter, typename Allocator>
@@ -445,7 +471,7 @@ class shared_ptr : public details::smart_ptr_base<T> {
     cb_alloc_t a{alloc};
     auto control_block = std::allocator_traits<cb_alloc_t>::allocate(a, 1);
     std::allocator_traits<cb_alloc_t>::construct(a, control_block, nullptr, std::move(deleter), a);
-    this->set_ptr_and_control_block(up.release(), control_block);
+    this->set_ptrs_and_esft(up.release(), control_block);
   }
   
   // ==========================================================================================
@@ -453,16 +479,13 @@ class shared_ptr : public details::smart_ptr_base<T> {
   // ==========================================================================================
   
   template<typename T2>
-  shared_ptr(const shared_ptr<T2>& other, element_type* p) noexcept {
-    other.increment_strong();
-    this->set_ptr_and_control_block(p, other.control_block);
+  shared_ptr(const shared_ptr<T2>& other, element_type* p) noexcept : base(p, other.control_block) {
+    this->increment_strong();
   }
-  
-  
+
   template<typename T2>
-  shared_ptr(shared_ptr<T2>&& other, element_type* p) noexcept {
-    this->set_ptr_and_control_block(p, other.control_block);
-    other.p = nullptr;
+  shared_ptr(shared_ptr<T2>&& other, element_type* p) noexcept : base(p, other.control_block) {
+    other.ptr = nullptr;
     other.control_block = nullptr;
   }
   
@@ -470,15 +493,15 @@ class shared_ptr : public details::smart_ptr_base<T> {
   //                                  COPY CONSTRUCTORS
   // ==========================================================================================
   
-  shared_ptr(const shared_ptr& other) noexcept : base(other.ptr, other.control_block) {
-    other.increment_strong();
+  shared_ptr(const shared_ptr& other) noexcept : base(other) {
+    this->increment_strong();
   }
   
   template<typename T2>
     requires std::convertible_to<T2*, T*>
-  shared_ptr(const shared_ptr<T2>& other) noexcept {
+  explicit(false) shared_ptr(const shared_ptr<T2>& other) noexcept {        // NOLINT(google-explicit-constructor)
     other.increment_strong();
-    this->set_ptr_and_control_block(other.ptr, other.control_block);
+    this->set_ptrs_and_esft(other.ptr, other.control_block);
   }
   
   // ==========================================================================================
@@ -486,15 +509,15 @@ class shared_ptr : public details::smart_ptr_base<T> {
   // ==========================================================================================
   
   shared_ptr(shared_ptr&& other) noexcept {
-    this->set_ptr_and_control_block(other.ptr, other.control_block);
+    this->set_ptrs_and_esft(other.ptr, other.control_block);
     other.ptr = nullptr;
     other.control_block = nullptr;
   }
   
   template<typename T2>
     requires std::convertible_to<T2*, T*>
-  shared_ptr(shared_ptr<T2>&& other) noexcept {
-    this->set_ptr_and_control_block(other.ptr, other.control_block);
+  explicit(false) shared_ptr(shared_ptr<T2>&& other) noexcept {         // NOLINT(google-explicit-constructor)
+    this->set_ptrs_and_esft(other.ptr, other.control_block);
     other.ptr = nullptr;
     other.control_block = nullptr;
   }
@@ -505,9 +528,9 @@ class shared_ptr : public details::smart_ptr_base<T> {
   
   template<typename T2>
     requires std::convertible_to<T2*, T*>
-  shared_ptr(const weak_ptr<T2>& other) {
+  explicit(false) shared_ptr(const weak_ptr<T2>& other) {               // NOLINT(google-explicit-constructor)
     if (other.increment_if_nonzero()) {
-      this->set_ptr_and_control_block(other.ptr, other.control_block);
+      this->set_ptrs_and_esft(other.ptr, other.control_block);
     }
     else {
       throw std::bad_weak_ptr();
@@ -516,14 +539,23 @@ class shared_ptr : public details::smart_ptr_base<T> {
   
   template<typename U, typename Deleter>
     requires std::convertible_to<U*, T*> && std::convertible_to<typename std::unique_ptr<U, Deleter>::pointer, T*>
-  shared_ptr(std::unique_ptr<U, Deleter>&& other) {
+  explicit(false) shared_ptr(std::unique_ptr<U, Deleter>&& other) {     // NOLINT(google-explicit-constructor)
     using ptr_type = typename std::unique_ptr<U, Deleter>::pointer;
-    using deleter_type = std::conditional_t<std::is_reference_v<Deleter>, decltype(std::ref(other.get_deleter())), Deleter>;
     
     if (other) {
-      auto control_block = new details::control_block_with_deleter<ptr_type, deleter_type>
-        (other.get(), std::forward<decltype(other.get_deleter())>(other.get_deleter()));
-      this->set_ptr_and_control_block(other.release(), control_block);
+      // [https://en.cppreference.com/w/cpp/memory/shared_ptr/shared_ptr]
+      // If Deleter is a reference type, it is equivalent to shared_ptr(r.release(), std::ref(r.get_deleter()).
+      // Otherwise, it is equivalent to shared_ptr(r.release(), std::move(r.get_deleter()))
+      if constexpr (std::is_reference_v<Deleter>) {
+        auto control_block = new details::control_block_with_deleter<ptr_type, decltype(std::ref(other.get_deleter()))>
+          (other.get(), std::ref(other.get_deleter()));
+        this->set_ptrs_and_esft(other.release(), control_block);
+      }
+      else {
+        auto control_block = new details::control_block_with_deleter<ptr_type, Deleter>
+          (other.get(), std::move(other.get_deleter()));
+        this->set_ptrs_and_esft(other.release(), control_block);
+      }
     }
   }
   
@@ -645,7 +677,23 @@ class shared_ptr : public details::smart_ptr_base<T> {
   friend shared_ptr<T0> allocate_shared_for_overwrite(const Allocator& allocator);
   
  private:
- 
+
+  template<typename U>
+  void set_ptrs_and_esft(U* ptr_, details::control_block_base* control_block_) {
+    static_assert(std::convertible_to<U*, T*>);
+
+    this->ptr = ptr_;
+    this->control_block = control_block_;
+
+    if constexpr(details::SupportsESFT<element_type>) {
+      if (this->ptr && this->ptr->weak_this.expired()) {
+        this->ptr->weak_this = shared_ptr<std::remove_cv_t<U>>(*this, const_cast<std::remove_cv_t<U>*>(this->ptr));
+      }
+    }
+  }
+
+  // Release the ptr and control_block to the caller.  Does not modify the reference count,
+  // so the caller is responsible for taking over the reference count owned by this copy
   std::pair<T*, details::control_block_base*> release_internals() noexcept {
     return std::make_pair(std::exchange(this->ptr, nullptr), std::exchange(this->control_block, nullptr));
   }
@@ -675,7 +723,7 @@ template<typename T, typename... Args>
 [[nodiscard]] shared_ptr<T> make_shared_for_overwrite() {
   const auto control_block = new details::control_block_inplace<T>(details::for_overwrite_tag{});
   shared_ptr<T> result;
-  result.set_ptr_and_control_block(control_block.get(), control_block);
+  result.set_ptrs_and_esft(control_block.get(), control_block);
   return result;
 }
 
@@ -688,7 +736,7 @@ template<typename T, typename Allocator, typename... Args>
   const auto control_block = std::allocator_traits<allocator_type>::allocate(a, 1);
   std::allocator_traits<allocator_type>::construct(a, control_block, a, std::forward<Args>(args)...);
   shared_ptr<T> result;
-  result.set_ptr_and_control_block(control_block.get(), control_block);
+  result.set_ptrs_and_esft(control_block.get(), control_block);
   return result;
 }
 
@@ -701,7 +749,7 @@ template<typename T, typename Allocator, typename... Args>
   const auto control_block = std::allocator_traits<allocator_type>::allocate(a, 1);
   std::allocator_traits<allocator_type>::construct(a, control_block, a, details::for_overwrite_tag{});
   shared_ptr<T> result;
-  result.set_ptr_and_control_block(control_block.get(), control_block);
+  result.set_ptrs_and_esft(control_block.get(), control_block);
   return result;
 }
 
@@ -741,9 +789,167 @@ auto operator==(std::nullptr_t, const shared_ptr<T0>& right) noexcept {
 
 template<typename T>
 class weak_ptr : public details::smart_ptr_base<T> {
-  // TODO
+
+  using base = details::smart_ptr_base<T>;
+
+ public:
+
+// ==========================================================================================
+//                                       CONSTRUCTORS
+// ==========================================================================================
+
+    constexpr weak_ptr() noexcept = default;
+
+    weak_ptr(const weak_ptr& other) noexcept : base(other) { }
+
+    template<typename T2>
+      requires std::convertible_to<T2*, T*>
+    explicit(false) weak_ptr(const shared_ptr<T2>& other) noexcept          // NOLINT(google-explicit-constructor)
+        : base(other) {
+      this->increment_weak();
+    }
+
+    template<typename T2>
+      requires std::convertible_to<T2*, T*> && std::convertible_to<T*, const T2*>
+    explicit(false) weak_ptr(const weak_ptr<T2>& other) noexcept            // NOLINT(google-explicit-constructor)
+        : base(other) {
+      this->increment_weak();
+    }
+
+    template<typename T2>
+      requires std::convertible_to<T2*, T*>
+    explicit(false) weak_ptr(const weak_ptr<T2>& other) noexcept            // NOLINT(google-explicit-constructor)
+      : base{} {
+
+      // This case is subtle.  If T2 virtually inherits T, then it might require RTTI to
+      // convert from T2* to T*.  If other.ptr is expired, the vtable may have been
+      // destroyed, which is very bad.  Furthermore, other.ptr could expire concurrently
+      // at any point by another thread, so we can not just check. So, we increment the
+      // strong ref count to prevent other from being destroyed while we copy.
+      if (other.control_block) {
+        this->control_block = other.control_block;
+        this->control_block->increment_weak_count();
+
+        if (this->increment_if_nonzero()) {
+          this->ptr = other.ptr;    // Now that we own a strong ref, it is safe to copy the ptr
+          this->control_block->decrement_strong_count();
+        }
+      }
+    }
+
+    weak_ptr(weak_ptr&& other) noexcept : base(std::move(other)) { }
+
+  template<typename T2>
+    requires std::convertible_to<T2*, T*> && std::convertible_to<T*, const T2*>
+  explicit(false) weak_ptr(weak_ptr<T2>&& other) noexcept                   // NOLINT(google-explicit-constructor)
+    : base(std::move(other)) { }
+
+  template<typename T2>
+    requires std::convertible_to<T2*, T*>
+  explicit(false) weak_ptr(weak_ptr<T2>&& other) noexcept : base{} {        // NOLINT(google-explicit-constructor)
+    this->control_block = std::exchange(other.control_block, nullptr);
+
+    // See comment in copy constructor.  Same subtlety applies.
+    if (this->increment_if_nonzero()) {
+      this->ptr = other.ptr;
+      this->control_block->decrement_strong_count();
+    }
+
+    other.ptr = nullptr;
+  }
+
+  ~weak_ptr() {
+    this->decrement_weak();
+  }
+
+// ==========================================================================================
+//                                       ASSIGNMENT OPERATORS
+// ==========================================================================================
+
+  weak_ptr& operator=(const weak_ptr& other) noexcept {
+    weak_ptr(other).swap(*this);
+    return *this;
+  }
+
+  template<typename T2>
+    requires std::convertible_to<T2*, T*>
+  weak_ptr& operator=(const weak_ptr<T2>& other) noexcept {
+    weak_ptr(other).swap(*this);
+    return *this;
+  }
+
+  weak_ptr& operator=(weak_ptr&& other) noexcept {
+    weak_ptr(std::move(other)).swap(*this);
+    return *this;
+  }
+
+  template<typename T2>
+    requires std::convertible_to<T2*, T*>
+  weak_ptr& operator=(weak_ptr<T2>&& other) noexcept {
+    weak_ptr(std::move(other)).swap(*this);
+    return *this;
+  }
+
+  template<typename T2>
+    requires std::convertible_to<T2*, T*>
+  weak_ptr& operator=(const shared_ptr<T2>& other) noexcept {
+    weak_ptr(other).swap(*this);
+    return *this;
+  }
+
+  void swap(weak_ptr& other) noexcept {
+    this->swap_ptrs(other);
+  }
+
+  [[nodiscard]] bool expired() const noexcept {
+    return this->use_count() == 0;
+  }
+
+  [[nodiscard]] shared_ptr<T> lock() const noexcept {
+    if (this->increment_if_nonzero()) {
+      return shared_ptr<T>{this->ptr, this->control_block};
+    }
+    return {nullptr};
+  }
+
 };
 
 
-}  // namespace parlay
+// ==========================================================================================
+//                                       shared_from_this
+// ==========================================================================================
 
+template<typename T>
+class enable_shared_from_this {
+protected:
+  constexpr enable_shared_from_this() noexcept : weak_this{} {}
+
+  enable_shared_from_this(enable_shared_from_this const&) noexcept : weak_this{} {}
+
+  enable_shared_from_this& operator=(enable_shared_from_this const&) noexcept { return *this; }
+
+  ~enable_shared_from_this() = default;
+
+public:
+  using esft_detector = enable_shared_from_this;
+
+  [[nodiscard]] weak_ptr<T> weak_from_this() {
+    return weak_this;
+  }
+
+  [[nodiscard]] weak_ptr<const T> weak_from_this() const {
+    return weak_this;
+  }
+
+  [[nodiscard]] shared_ptr<T> shared_from_this() {
+    return shared_ptr<T>{weak_this};
+  }
+
+  [[nodiscard]] shared_ptr<const T> shared_from_this() const {
+    return shared_ptr<const T>{weak_this};
+  }
+
+  mutable weak_ptr<T> weak_this;
+};
+
+}  // namespace parlay
