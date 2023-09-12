@@ -1,12 +1,17 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 
+#include <atomic>
 #include <deque>
+#include <memory>
 #include <new>
+#include <thread>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 
 #include <folly/container/F14Set.h>
 
@@ -41,6 +46,10 @@ inline constexpr std::size_t CACHE_LINE_ALIGNMENT = 2 * std::hardware_destructiv
 inline constexpr std::size_t CACHE_LINE_ALIGNMENT = 128;
 #endif
 
+enum class ReclamationMethod {
+  amortized_reclamation,                // Reclamation happens in bulk in the retiring thread
+  background_thread_reclamation,        // Reclamation happens asynchronously in a background thread
+};
 
 template<typename T>
 concept GarbageCollectible = requires(T* t, T* tp) {
@@ -73,14 +82,6 @@ extern inline HazardPointers<GarbageType>& get_hazard_list();
 // background thread could stall and not actually free anything.
 template<typename GarbageType> requires GarbageCollectible<GarbageType>
 class HazardPointers {
-
- public:
-  enum class ReclamationMethod {
-    amortized_reclamation,                // Reclamation happens in bulk in the retiring thread
-    background_thread_reclamation,        // Reclamation happens asynchronously in a background thread
-  };
-
- private:
 
   // After this many retires, a thread will attempt to clean up the contents of
   // its local retired list, deleting any retired objects that are not protected.
@@ -313,16 +314,19 @@ public:
   }
 
   // Change the reclamation method.  Not thread safe, and not safe to call concurrently
-  // while any hazard pointers are held.  Only one thread may call this, and during a
-  // quiescent state in which there are no hazard pointers.
+  // while any hazard pointers are held, or while another thread might retire something.
   void set_reclamation_mode(ReclamationMethod new_mode) {
     if (new_mode == ReclamationMethod::background_thread_reclamation) {
-      cleanup_executor = std::make_unique<executor_type>(std::make_pair(1,1),
-        std::make_shared<folly::NamedThreadFactory>("atomic-sp-tpe-"));
+      //cleanup_executor = std::make_unique<executor_type>(std::make_pair(1,1),
+      //  std::make_shared<folly::NamedThreadFactory>("atomic-sp-tpe-"));
+
+      reclaimer_thread = std::jthread([&]() {
+
+      });
     }
     else {
-      force_background_cleanup();     // Flush all retired lists so we don't leak anything
-      cleanup_executor = nullptr;
+      //force_background_cleanup();     // Flush all retired lists so we don't leak anything
+      //cleanup_executor = nullptr;
     }
     mode = new_mode;
   }
@@ -345,10 +349,10 @@ private:
 
   FOLLY_NOINLINE void cleanup(HazardSlot& slot) {
     slot.num_retires_since_cleanup = 0;
-    folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
 
     if (mode == ReclamationMethod::amortized_reclamation) {
       // Perform reclamation now on the current thread
+      folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
       scan_hazard_pointers([&](auto p) { slot.protected_set.insert(p); });
       slot.retired_list.cleanup([&](auto p) { return slot.protected_set.count(p) > 0; });
       slot.protected_set.clear();    // Does not free memory, only clears contents
@@ -358,12 +362,15 @@ private:
       // thread pool because the reclamation method below is not thread safe.
       assert(mode == ReclamationMethod::background_thread_reclamation);
       assert(cleanup_executor != nullptr);
+
       cleanup_executor->add([this, retired_list = std::move(slot.retired_list), &slot]() mutable {
+        folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
         scan_hazard_pointers([&](auto p) { slot.protected_set.insert(p); });
         slot.leftovers.cleanup([&](auto p) { return slot.protected_set.count(p) > 0; });
         retired_list.cleanup_and_move(slot.leftovers, [&](auto p) { return slot.protected_set.count(p) > 0; });
         slot.protected_set.clear();    // Does not free memory, only clears contents
       });
+
     }
   }
 
@@ -387,7 +394,8 @@ private:
   ReclamationMethod mode{ReclamationMethod::amortized_reclamation};
   HazardSlot* const list_head;
 
-  std::unique_ptr<executor_type> cleanup_executor;
+  //std::unique_ptr<executor_type> cleanup_executor;
+  std::jthread reclaimer_thread{};
 
   // Background thread reclamation is handled by a thread pool executor. The pool
   // only contains one thread since the reclamation method is not thread safe.

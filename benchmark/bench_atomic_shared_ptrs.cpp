@@ -47,7 +47,6 @@ struct StlAtomicSharedPtr {
 
 #endif
 
-
 constexpr auto compute_low = [](std::vector<double>& v) -> double {
   std::nth_element(v.begin(), v.begin() + v.size()/100, v.end());
   return v[v.size()/100];
@@ -66,6 +65,8 @@ constexpr auto compute_high = [](std::vector<double>& v) -> double {
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
 static void bench_load(benchmark::State& state) {
+  //parlay::get_hazard_list<parlay::details::control_block_base>().set_reclamation_mode(parlay::ReclamationMethod::background_thread_reclamation);
+
   AtomicSharedPtr<int> src;
   src.store(SharedPtr<int>(new int(42)));
 
@@ -152,13 +153,13 @@ static void bench_store_copy(benchmark::State& state) {
   SETUP_BENCHMARK(name, "store-del", (bench_store_delete<atomic_sp, sp>));
 
 
-BENCH_PTR("STL", StlAtomicSharedPtr, std::shared_ptr);
-BENCH_PTR("Folly", folly::atomic_shared_ptr, std::shared_ptr);
+//BENCH_PTR("STL", StlAtomicSharedPtr, std::shared_ptr);
+//BENCH_PTR("Folly", folly::atomic_shared_ptr, std::shared_ptr);
 BENCH_PTR("Mine", parlay::atomic_shared_ptr, parlay::shared_ptr);
-BENCH_PTR("JSS-Free", jss::atomic_shared_ptr, jss::shared_ptr);
-BENCH_PTR("Vtyulb", LFStructs::AtomicSharedPtr, LFStructs::SharedPtr);
-BENCH_PTR("Mine-basic", parlay::basic::atomic_shared_ptr, parlay::basic::shared_ptr);
+//BENCH_PTR("JSS-Free", jss::atomic_shared_ptr, jss::shared_ptr);
+//BENCH_PTR("Vtyulb", LFStructs::AtomicSharedPtr, LFStructs::SharedPtr);
+//BENCH_PTR("Mine-basic", parlay::basic::atomic_shared_ptr, parlay::basic::shared_ptr);
 
 #ifdef JUST_THREADS_AVAILABLE
-BENCH_PTR("JSS", std::experimental::atomic_shared_ptr, std::experimental::shared_ptr);
+//BENCH_PTR("JSS", std::experimental::atomic_shared_ptr, std::experimental::shared_ptr);
 #endif
