@@ -8,6 +8,7 @@
 #include <deque>
 #include <memory>
 #include <new>
+#include <stop_token>
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
@@ -89,7 +90,6 @@ class HazardPointers {
 
   using garbage_type = GarbageType;
   using protected_set_type = folly::F14FastSet<garbage_type*>;
-  using executor_type = folly::CPUThreadPoolExecutor;
 
   // The retired list is an intrusive linked list of retired blocks. It takes advantage
   // of the available managed object pointer in the control block to store the next pointers.
@@ -101,6 +101,13 @@ class HazardPointers {
 
     constexpr RetiredList() noexcept = default;
 
+    explicit RetiredList(garbage_type* head_) : head(head_) { }
+
+    RetiredList& operator=(garbage_type* head_) {
+      assert(head == nullptr);
+      head = head_;
+    }
+
     RetiredList(const RetiredList&) = delete;
 
     RetiredList(RetiredList&& other) noexcept : head(std::exchange(other.head, nullptr)) { }
@@ -111,6 +118,7 @@ class HazardPointers {
 
     void push(garbage_type* p) noexcept {
       p->set_next(std::exchange(head, p));
+      if (p->get_next() == nullptr) [[unlikely]] tail = p;
     }
 
     // For each element x currently in the retired list, if is_protected(x) == false,
@@ -156,8 +164,8 @@ class HazardPointers {
       }
     }
 
-  private:
-    garbage_type* head = nullptr;
+    garbage_type* head{nullptr};
+    garbage_type* tail{nullptr};
   };
 
   // Each thread owns a hazard entry slot which contains a single hazard pointer
@@ -184,22 +192,28 @@ class HazardPointers {
     // cleanup_threshold, we will perform cleanup.
     std::size_t num_retires_since_cleanup{0};
 
-    // True if a thread owns this slot, else false.
-    std::atomic<bool> in_use;
-
     // Set of protected objects used by cleanup().  Re-used between cleanups so that
     // we don't have to allocate new memory unless the table gets full, which would
     // only happen if the user spawns substantially more threads than were active
     // during the previous call to cleanup().
-    //
-    // Pushed to another cache line to avoid false sharing with the protected_ptr
-    // and retired list in case reclamation is performed in a background thread.
-    alignas(CACHE_LINE_ALIGNMENT) protected_set_type protected_set{2 * std::thread::hardware_concurrency()};
+    protected_set_type protected_set{2 * std::thread::hardware_concurrency()};
 
-    // Retired objects that were not successfully cleaned up during the last
-    // cleanup because they were protected. They will be tried again next
-    // time.  Only used by reclamation performed in a background thread.
-    RetiredList leftovers{};
+    // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //   Above: Single-writier thread-local variables. Written by the owning thread
+    // =============================================================================
+    //   Below: Data shared with other threads and used by the background reclaimer
+    // vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+
+    // True if a thread owns this slot, else false.
+    alignas(CACHE_LINE_ALIGNMENT) std::atomic<bool> in_use;
+
+    // A synchronized location for the main thread to hand off garbage
+    // to the background reclaimer thread.
+    std::atomic<garbage_type*> available_garbage;
+
+    // Local (unsynchronized) variables used by the background reclaimer thread.
+    garbage_type* old_garbage;
+    garbage_type* prev_garbage;
   };
 
   // Find an available hazard slot, or allocate a new one if none available.
@@ -317,34 +331,78 @@ public:
   // while any hazard pointers are held, or while another thread might retire something.
   void set_reclamation_mode(ReclamationMethod new_mode) {
     if (new_mode == ReclamationMethod::background_thread_reclamation) {
-      //cleanup_executor = std::make_unique<executor_type>(std::make_pair(1,1),
-      //  std::make_shared<folly::NamedThreadFactory>("atomic-sp-tpe-"));
-
-      reclaimer_thread = std::jthread([&]() {
-
-      });
+      // Start a reclaimer thread
+      reclaimer_thread = std::jthread(BackgroundReclaimer{*this});
     }
     else {
-      //force_background_cleanup();     // Flush all retired lists so we don't leak anything
-      //cleanup_executor = nullptr;
+      auto stop_source = reclaimer_thread.get_stop_source();
+      stop_source.request_stop();
+      force_complete_background_cleanup();     // Flush all retired lists, so we don't leak anything
     }
     mode = new_mode;
   }
 
 private:
 
+  struct BackgroundReclaimer {
+
+    explicit BackgroundReclaimer(HazardPointers& parent_) : parent(parent_) { }
+
+    void operator()(std::stop_token stoken) {
+      folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
+
+      // Start the garbage pipeline by acquiring the set of announced hazard pointers.
+      // The first set can not be interleaved since we can only retire garbage that we
+      // know was retired before we read every announced hazard pointer.
+      parent.for_each_slot([&](HazardSlot& slot) {
+        slot.old_garbage = slot.available_garbage.exchange(nullptr);
+      });
+      parent.scan_hazard_pointers([&](garbage_type* p) {
+        protected_set.insert(p);
+      });
+
+      while (!stoken.stop_requested()) {
+        folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
+
+        leftovers.cleanup([&](auto p) { return protected_set.count(p) > 0; });
+
+        parent.for_each_slot([&](HazardSlot& slot) {
+          RetiredList list(std::exchange(slot.old_garbage, slot.prev_garbage));
+          list.cleanup_and_move(leftovers, [&](auto p) { return protected_set.count(p) > 0; });
+
+          slot.prev_garbage = slot.available_garbage.exchange(nullptr);
+          next_protected_set.insert(slot.protected_ptr.load());
+        });
+
+        protected_set.swap(next_protected_set);
+        next_protected_set.clear();
+      }
+    }
+
+    HazardPointers& parent;
+    RetiredList leftovers;
+    protected_set_type next_protected_set{2 * std::thread::hardware_concurrency()};
+    protected_set_type protected_set{2 * std::thread::hardware_concurrency()};
+  };
+
+  template<typename F>
+  void for_each_slot(F&& f) noexcept(std::is_nothrow_invocable_v<F&, HazardSlot&>) {
+    auto current = list_head;
+    while (current) {
+      f(*current);
+      current = current->next.load();
+    }
+  }
 
   // Apply the function f to all currently announced hazard pointers
   template<typename F>
   void scan_hazard_pointers(F&& f) noexcept(std::is_nothrow_invocable_v<F&, garbage_type*>) {
-    auto current = list_head;
-    while (current) {
-      auto p = current->protected_ptr.load();
+    for_each_slot([&, f = std::forward<F>(f)](HazardSlot& slot) {
+      auto p = slot.protected_ptr.load();
       if (p) {
         f(p);
       }
-      current = current->next.load();
-    }
+    });
   }
 
   FOLLY_NOINLINE void cleanup(HazardSlot& slot) {
@@ -361,16 +419,11 @@ private:
       // Perform reclamation on the executor. Note that there is only one thread in the
       // thread pool because the reclamation method below is not thread safe.
       assert(mode == ReclamationMethod::background_thread_reclamation);
-      assert(cleanup_executor != nullptr);
 
-      cleanup_executor->add([this, retired_list = std::move(slot.retired_list), &slot]() mutable {
-        folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
-        scan_hazard_pointers([&](auto p) { slot.protected_set.insert(p); });
-        slot.leftovers.cleanup([&](auto p) { return slot.protected_set.count(p) > 0; });
-        retired_list.cleanup_and_move(slot.leftovers, [&](auto p) { return slot.protected_set.count(p) > 0; });
-        slot.protected_set.clear();    // Does not free memory, only clears contents
-      });
-
+      // Hand off retired list
+      garbage_type* current_available = slot.available_garbage.exchange(nullptr);
+      slot.retired_list.tail->set_next(current_available);
+      slot.available_garbage.store(std::exchange(slot.retired_list.head, nullptr));
     }
   }
 
@@ -379,10 +432,9 @@ private:
   // must not be called while holding any hazard pointers, or it could be unsafe.
   // No retires should happen concurrently either because they might trigger
   // additional reclamation which would race.
-  void force_background_cleanup() {
+  void force_complete_background_cleanup() {
     assert(mode == ReclamationMethod::background_thread_reclamation);
-    assert(cleanup_executor != nullptr);
-    cleanup_executor->join();
+    reclaimer_thread.join();
     auto current = list_head;
     while (current) {
       current->retired_list.cleanup([](auto&&) { return false; });
@@ -394,20 +446,8 @@ private:
   ReclamationMethod mode{ReclamationMethod::amortized_reclamation};
   HazardSlot* const list_head;
 
-  //std::unique_ptr<executor_type> cleanup_executor;
+  // Background thread that reclaims unprotected garbage
   std::jthread reclaimer_thread{};
-
-  // Background thread reclamation is handled by a thread pool executor. The pool
-  // only contains one thread since the reclamation method is not thread safe.
-  // Only initialized if mode = background_thread_reclamation.
-//  static inline executor_type& get_cleanup_executor() {
-//    static_assert(std::is_trivially_destructible_v<detail::Immortal<executor_type>>);
-//
-//    static detail::Immortal<executor_type> executor(std::make_pair(1,1),
-//      std::make_shared<folly::NamedThreadFactory>("atomic-sp-tpe-"));
-//
-//    return executor;
-//  }
 
   static inline const thread_local HazardSlotOwner local_slot{get_hazard_list<garbage_type>()};
 };

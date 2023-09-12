@@ -65,7 +65,7 @@ constexpr auto compute_high = [](std::vector<double>& v) -> double {
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
 static void bench_load(benchmark::State& state) {
-  //parlay::get_hazard_list<parlay::details::control_block_base>().set_reclamation_mode(parlay::ReclamationMethod::background_thread_reclamation);
+  parlay::get_hazard_list<parlay::details::control_block_base>().set_reclamation_mode(parlay::ReclamationMethod::background_thread_reclamation);
 
   AtomicSharedPtr<int> src;
   src.store(SharedPtr<int>(new int(42)));
