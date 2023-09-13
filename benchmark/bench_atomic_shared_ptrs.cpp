@@ -62,6 +62,10 @@ constexpr auto compute_high = [](std::vector<double>& v) -> double {
   return v[v.size()*99/100];
 };
 
+constexpr auto compute_tail = [](std::vector<double>& v) -> double {
+  std::nth_element(v.begin(), v.begin() + v.size()*999/0100, v.end());
+  return v[v.size()*999/1000];
+};
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
 static void bench_load(benchmark::State& state) {
@@ -85,6 +89,7 @@ static void bench_load(benchmark::State& state) {
   state.counters["1%"] = compute_low(all_times);
   state.counters["50%"] = compute_med(all_times);
   state.counters["99%"] = compute_high(all_times);
+  state.counters["99.9%"] = compute_tail(all_times);
 }
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
@@ -110,6 +115,7 @@ static void bench_store_delete(benchmark::State& state) {
   state.counters["1%"] = compute_low(all_times);
   state.counters["50%"] = compute_med(all_times);
   state.counters["99%"] = compute_high(all_times);
+  state.counters["99.9%"] = compute_tail(all_times);
 }
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
@@ -138,6 +144,7 @@ static void bench_store_copy(benchmark::State& state) {
   state.counters["1%"] = compute_low(all_times);
   state.counters["50%"] = compute_med(all_times);
   state.counters["99%"] = compute_high(all_times);
+  state.counters["99.9%"] = compute_tail(all_times);
 }
 
 

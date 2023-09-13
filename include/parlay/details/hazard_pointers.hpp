@@ -271,6 +271,10 @@ public:
   }
 
   ~HazardPointers() {
+    if (mode == ReclamationMethod::background_thread_reclamation) {
+      reclaimer_thread.request_stop();
+      reclaimer_thread.join();
+    }
     auto current = list_head;
     while (current) {
       auto old = std::exchange(current, current->next.load());
@@ -342,6 +346,7 @@ private:
     explicit BackgroundReclaimer(HazardPointers& parent_) : parent(parent_) { }
 
     void operator()(std::stop_token stoken) {
+
       folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
 
       // Start the garbage pipeline by acquiring the set of announced hazard pointers.
