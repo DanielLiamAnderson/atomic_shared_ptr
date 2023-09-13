@@ -5,8 +5,9 @@
 #include <thread>
 #include <vector>
 
-
 TEST(TestAtomicSharedPtr, TestConstructionEmpty) {
+  parlay::enable_background_reclamation();
+
   atomic_shared_ptr<int> p;
   
   auto s = p.load();

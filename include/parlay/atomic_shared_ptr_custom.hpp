@@ -9,6 +9,9 @@
 
 namespace parlay {
 
+inline void enable_background_reclamation() {
+  get_hazard_list<parlay::details::control_block_base>().enable_background_reclamation();
+}
 
 template<typename T>
 class atomic_shared_ptr {

@@ -151,12 +151,12 @@ class HazardPointers {
     // then x->destroy() and remove x from the retired list.  Otherwise, move x onto
     // the leftovers list.  Leaves the current list empty.
     template<typename F>
-    void cleanup_and_move(RetiredList& leftovers, F&& is_protected) {
+    void cleanup_and_move(RetiredList& into, F&& is_protected) {
 
       while (head) {
         garbage_type* current = std::exchange(head, head->get_next());
         if (is_protected(current)) {
-          leftovers.push(current);
+          into.push(current);
         }
         else {
           current->destroy();
@@ -209,11 +209,11 @@ class HazardPointers {
 
     // A synchronized location for the main thread to hand off garbage
     // to the background reclaimer thread.
-    std::atomic<garbage_type*> available_garbage;
+    std::atomic<garbage_type*> available_garbage{nullptr};
 
     // Local (unsynchronized) variables used by the background reclaimer thread.
-    garbage_type* old_garbage;
-    garbage_type* prev_garbage;
+    garbage_type* old_garbage{nullptr};
+    garbage_type* prev_garbage{nullptr};
   };
 
   // Find an available hazard slot, or allocate a new one if none available.
@@ -329,17 +329,10 @@ public:
 
   // Change the reclamation method.  Not thread safe, and not safe to call concurrently
   // while any hazard pointers are held, or while another thread might retire something.
-  void set_reclamation_mode(ReclamationMethod new_mode) {
-    if (new_mode == ReclamationMethod::background_thread_reclamation) {
-      // Start a reclaimer thread
-      reclaimer_thread = std::jthread(BackgroundReclaimer{*this});
-    }
-    else {
-      auto stop_source = reclaimer_thread.get_stop_source();
-      stop_source.request_stop();
-      force_complete_background_cleanup();     // Flush all retired lists, so we don't leak anything
-    }
-    mode = new_mode;
+  void enable_background_reclamation() {
+    // Start a reclaimer thread
+    reclaimer_thread = std::jthread(BackgroundReclaimer{*this});
+    mode = ReclamationMethod::background_thread_reclamation;
   }
 
 private:
@@ -364,11 +357,11 @@ private:
       while (!stoken.stop_requested()) {
         folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
 
-        leftovers.cleanup([&](auto p) { return protected_set.count(p) > 0; });
+        parent.leftovers.cleanup([&](auto p) { return protected_set.count(p) > 0; });
 
         parent.for_each_slot([&](HazardSlot& slot) {
           RetiredList list(std::exchange(slot.old_garbage, slot.prev_garbage));
-          list.cleanup_and_move(leftovers, [&](auto p) { return protected_set.count(p) > 0; });
+          list.cleanup_and_move(parent.leftovers, [&](auto p) { return protected_set.count(p) > 0; });
 
           slot.prev_garbage = slot.available_garbage.exchange(nullptr);
           next_protected_set.insert(slot.protected_ptr.load());
@@ -380,7 +373,6 @@ private:
     }
 
     HazardPointers& parent;
-    RetiredList leftovers;
     protected_set_type next_protected_set{2 * std::thread::hardware_concurrency()};
     protected_set_type protected_set{2 * std::thread::hardware_concurrency()};
   };
@@ -427,27 +419,12 @@ private:
     }
   }
 
-  // Force all pending background retires to be processed.  This will clear out all
-  // retired lists **without checking for hazard pointer protection**, so this
-  // must not be called while holding any hazard pointers, or it could be unsafe.
-  // No retires should happen concurrently either because they might trigger
-  // additional reclamation which would race.
-  void force_complete_background_cleanup() {
-    assert(mode == ReclamationMethod::background_thread_reclamation);
-    reclaimer_thread.join();
-    auto current = list_head;
-    while (current) {
-      current->retired_list.cleanup([](auto&&) { return false; });
-      current->leftovers.cleanup([](auto&&) { return false; });
-      current = current->next.load();
-    }
-  }
-
   ReclamationMethod mode{ReclamationMethod::amortized_reclamation};
   HazardSlot* const list_head;
 
   // Background thread that reclaims unprotected garbage
-  std::jthread reclaimer_thread{};
+  alignas(CACHE_LINE_ALIGNMENT) std::jthread reclaimer_thread{};
+  RetiredList leftovers;
 
   static inline const thread_local HazardSlotOwner local_slot{get_hazard_list<garbage_type>()};
 };
