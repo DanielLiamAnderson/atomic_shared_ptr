@@ -69,7 +69,7 @@ constexpr auto compute_tail = [](std::vector<double>& v) -> double {
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
 static void bench_load(benchmark::State& state) {
-  parlay::enable_background_reclamation();
+  //parlay::enable_background_reclamation();
 
   AtomicSharedPtr<int> src;
   src.store(SharedPtr<int>(new int(42)));

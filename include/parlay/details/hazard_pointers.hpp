@@ -198,6 +198,8 @@ class HazardPointers {
     // during the previous call to cleanup().
     protected_set_type protected_set{2 * std::thread::hardware_concurrency()};
 
+    protected_set_type next_protected_set{2 * std::thread::hardware_concurrency()};
+
     // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     //   Above: Single-writier thread-local variables. Written by the owning thread
     // =============================================================================
@@ -362,11 +364,11 @@ private:
       while (!stoken.stop_requested()) {
         folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
 
-        parent.leftovers.cleanup([&](auto p) { return protected_set.count(p) > 0; });
+        leftovers.cleanup([&](auto p) { return protected_set.count(p) > 0; });
 
         parent.for_each_slot([&](HazardSlot& slot) {
           RetiredList list(std::exchange(slot.old_garbage, slot.prev_garbage));
-          list.cleanup_and_move(parent.leftovers, [&](auto p) { return protected_set.count(p) > 0; });
+          list.cleanup_and_move(leftovers, [&](auto p) { return protected_set.count(p) > 0; });
 
           slot.prev_garbage = slot.available_garbage.exchange(nullptr);
           next_protected_set.insert(slot.protected_ptr.load());
@@ -374,12 +376,49 @@ private:
 
         protected_set.swap(next_protected_set);
         next_protected_set.clear();
+
+        std::this_thread::sleep_for(std::chrono::microseconds(10));
       }
+
     }
 
     HazardPointers& parent;
+    RetiredList leftovers;
     protected_set_type next_protected_set{2 * std::thread::hardware_concurrency()};
     protected_set_type protected_set{2 * std::thread::hardware_concurrency()};
+  };
+
+  struct DeamortizedReclaimer {
+
+    void do_some_reclamation() {
+      num_retires++;
+
+      if (current_slot == nullptr) {
+        if (num_retires < 2 * num_hazard_pointers) {
+
+        }
+
+        current_slot = head_slot;
+
+        protected_set.swap(next_protected_set);
+        next_protected_set.clear();     // The only not-O(1) operation, but its fast
+      }
+
+
+
+    }
+
+    HazardSlot* const head_slot;
+    HazardSlot* current_slot;
+
+    protected_set_type protected_set;
+    protected_set_type next_protected_set;
+
+    RetiredList eligible;
+    RetiredList next_eligible;
+
+    unsigned int num_hazard_pointers{std::thread::hardware_concurrency()};     // A local estimate of the number of active hazard pointers
+    unsigned int num_retires{0};
   };
 
   template<typename F>
@@ -428,8 +467,8 @@ private:
   HazardSlot* const list_head;
 
   // Background thread that reclaims unprotected garbage
-  alignas(CACHE_LINE_ALIGNMENT) std::jthread reclaimer_thread{};
-  RetiredList leftovers;
+  std::jthread reclaimer_thread{};
+
 
   static inline const thread_local HazardSlotOwner local_slot{get_hazard_list<garbage_type>()};
 };
