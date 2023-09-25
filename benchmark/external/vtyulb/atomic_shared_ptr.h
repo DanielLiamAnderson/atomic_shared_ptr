@@ -68,6 +68,13 @@ public:
         }
         return *this;
     }
+
+    SharedPtr& operator=(std::nullptr_t) {
+        auto old = std::exchange(controlBlock, nullptr);
+        unref(old);
+        return *this;
+    }
+
     ~SharedPtr() {
         thread_local std::vector<ControlBlock<T>*> destructionQueue;
         thread_local bool destructionInProgress = false;
@@ -87,6 +94,8 @@ public:
     SharedPtr copy() { return SharedPtr(*this); }
     T* get() const { return controlBlock ? controlBlock->data : nullptr; }
     T* operator->() const { return controlBlock->data; }
+
+    /* implicit */ explicit(false) operator bool() const noexcept { return get() != nullptr; }      // NOLINT
 
 private:
     void unref(ControlBlock<T> *blockToUnref) {
@@ -188,7 +197,10 @@ public:
     SharedPtr<T> load();
     FastSharedPtr<T> getFast();
 
-    bool compareExchange(T *expected, SharedPtr<T> &&newOne); // this actually is strong version
+    bool compareExchange(T *expected, SharedPtr<T> &&newOne);                       // this actually is strong version
+
+    bool compare_exchange_strong(SharedPtr<T>& expected, SharedPtr<T> desired);      // this actually is strong version
+    bool compare_exchange_weak(SharedPtr<T>& expected, SharedPtr<T> desired);
 
     void store(T *data);
     void store(SharedPtr<T>&& data);
@@ -321,6 +333,16 @@ bool AtomicSharedPtr<T>::compareExchange(T *expected, SharedPtr<T> &&newOne) {
     }
 
     return false;
+}
+
+template<typename T>
+bool AtomicSharedPtr<T>::compare_exchange_strong(SharedPtr<T>& expected, SharedPtr<T> desired) {
+  return compareExchange(expected.get(), std::move(desired));
+}
+
+template<typename T>
+bool AtomicSharedPtr<T>::compare_exchange_weak(SharedPtr<T>& expected, SharedPtr<T> desired) {
+  return compareExchange(expected.get(), std::move(desired));
 }
 
 template<typename T>

@@ -79,3 +79,10 @@ TEST(TestSharedPtr, TestAliasMoveConstructor) {
   ASSERT_EQ(dest->str(), "Derived");
 }
 
+TEST(TestSharedPtr, TestMakeShared) {
+  parlay::shared_ptr<int> p = parlay::make_shared<int>(42);
+}
+
+TEST(TestSharedPtr, TestMakeSharedNonTrivial) {
+  parlay::shared_ptr<std::string> s = parlay::make_shared<std::string>(1000, 'b');
+}

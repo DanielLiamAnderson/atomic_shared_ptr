@@ -4,48 +4,13 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <thread>
 #include <utility>
 
 #include <benchmark/benchmark.h>
 
-#include <folly/concurrency/AtomicSharedPtr.h>
+#include "all_ptrs.hpp"
 
-#include "external/anthonywilliams/atomic_shared_ptr"
-#include "external/vtyulb/atomic_shared_ptr.h"
-
-#ifdef JUST_THREADS_AVAILABLE
-#include <experimental/atomic>
-#endif
-
-#include "parlay/atomic_shared_ptr_custom.hpp"
-
-#include "parlay/basic_atomic_shared_ptr.hpp"
-
-#ifdef __cpp_lib_atomic_shared_ptr
-
-// C++ standard library atomic support for shared ptrs
-template<typename T>
-using StlAtomicSharedPtr = std::atomic<std::shared_ptr<T>>;
-
-#else
-
-// Use free functions if std::atomic<shared_ptr> is not available. Much worse.
-template<typename T>
-struct StlAtomicSharedPtr {
-  StlAtomicSharedPtr() = default;
-  explicit(false) StlAtomicSharedPtr(std::shared_ptr<T> other) : sp(std::move(other)) { }   // NOLINT
-  std::shared_ptr<T> load() { return std::atomic_load(&sp); }
-  void store(std::shared_ptr<T> r) { std::atomic_store(&sp, std::move(r)); }
-  bool compare_exchange_strong(std::shared_ptr<T>& expected, std::shared_ptr<T> desired) {
-    return atomic_compare_exchange_strong(&sp, &expected, std::move(desired));
-  }
-  bool compare_exchange_weak(std::shared_ptr<T>& expected, std::shared_ptr<T> desired) {
-    return atomic_compare_exchange_weak(&sp, &expected, std::move(desired));
-  }
-  std::shared_ptr<T> sp;
-};
-
-#endif
 
 constexpr auto compute_low = [](std::vector<double>& v) -> double {
   std::nth_element(v.begin(), v.begin() + v.size()/100, v.end());
@@ -63,16 +28,28 @@ constexpr auto compute_high = [](std::vector<double>& v) -> double {
 };
 
 constexpr auto compute_tail = [](std::vector<double>& v) -> double {
-  std::nth_element(v.begin(), v.begin() + v.size()*999/0100, v.end());
-  return v[v.size()*999/1000];
+  std::nth_element(v.begin(), v.begin() + v.size()*9995/10000, v.end());
+  return v[v.size()*9995/10000];
 };
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
 static void bench_load(benchmark::State& state) {
-  //parlay::enable_background_reclamation();
+  parlay::enable_deamortized_reclamation();
+
+  int n_threads = state.range(0);     // Spawn n-1 contending threads
 
   AtomicSharedPtr<int> src;
   src.store(SharedPtr<int>(new int(42)));
+
+  std::vector<std::jthread> enemies;
+  enemies.reserve(n_threads-1);
+  for (int i = 0; i < n_threads - 1; i++) {
+    enemies.emplace_back([mine = SharedPtr<int>(new int(i+1)), &src](std::stop_token stoken) {
+      while (!stoken.stop_requested()) {
+        src.store(mine);    // Stores a copy so we're not spamming retires
+      }
+    });
+  }
 
   std::vector<double> all_times;
 
@@ -86,16 +63,34 @@ static void bench_load(benchmark::State& state) {
     all_times.push_back(elapsed_time.count());
   }
 
+  for (auto& t : enemies) {
+    t.request_stop();
+    t.join();
+  }
+
   state.counters["1%"] = compute_low(all_times);
   state.counters["50%"] = compute_med(all_times);
   state.counters["99%"] = compute_high(all_times);
-  state.counters["99.9%"] = compute_tail(all_times);
+  state.counters["99.95%"] = compute_tail(all_times);
 }
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
 static void bench_store_delete(benchmark::State& state) {
+
+  int n_threads = state.range(0);     // Spawn n-1 contending threads
+
   AtomicSharedPtr<int> src;
   src.store(SharedPtr<int>(new int(42)));
+
+  std::vector<std::jthread> enemies;
+  enemies.reserve(n_threads-1);
+  for (int i = 0; i < n_threads - 1; i++) {
+    enemies.emplace_back([mine = SharedPtr<int>(new int(i+1)), &src](std::stop_token stoken) {
+      while (!stoken.stop_requested()) {
+        src.store(mine);    // Stores a copy so we're not spamming retires
+      }
+    });
+  }
 
   std::vector<double> all_times;
 
@@ -112,18 +107,36 @@ static void bench_store_delete(benchmark::State& state) {
     all_times.push_back(elapsed_time.count());
   }
 
+  for (auto& t : enemies) {
+    t.request_stop();
+    t.join();
+  }
+
   state.counters["1%"] = compute_low(all_times);
   state.counters["50%"] = compute_med(all_times);
   state.counters["99%"] = compute_high(all_times);
-  state.counters["99.9%"] = compute_tail(all_times);
+  state.counters["99.95%"] = compute_tail(all_times);
 }
 
 template<template<typename> typename AtomicSharedPtr, template<typename> typename SharedPtr>
 static void bench_store_copy(benchmark::State& state) {
+
+  int n_threads = state.range(0);     // Spawn n-1 contending threads
+
   AtomicSharedPtr<int> src;
   src.store(SharedPtr<int>(new int(42)));
 
   auto my_sp = SharedPtr<int>(new int(42));
+
+  std::vector<std::jthread> enemies;
+  enemies.reserve(n_threads-1);
+  for (int i = 0; i < n_threads - 1; i++) {
+    enemies.emplace_back([mine = SharedPtr<int>(new int(i+1)), &src](std::stop_token stoken) {
+      while (!stoken.stop_requested()) {
+        src.store(mine);    // Stores a copy so we're not spamming retires
+      }
+    });
+  }
 
   std::vector<double> all_times;
 
@@ -141,10 +154,15 @@ static void bench_store_copy(benchmark::State& state) {
     all_times.push_back(elapsed_time.count());
   }
 
+  for (auto& t : enemies) {
+    t.request_stop();
+    t.join();
+  }
+
   state.counters["1%"] = compute_low(all_times);
   state.counters["50%"] = compute_med(all_times);
   state.counters["99%"] = compute_high(all_times);
-  state.counters["99.9%"] = compute_tail(all_times);
+  state.counters["99.95%"] = compute_tail(all_times);
 }
 
 
@@ -152,7 +170,8 @@ static void bench_store_copy(benchmark::State& state) {
 #define SETUP_BENCHMARK(ptr_name, bench_name, bench)       \
   BENCHMARK(bench)                                         \
     ->Name(ptr_name "::" bench_name)                       \
-    ->UseManualTime();
+    ->UseManualTime()                                      \
+    ->RangeMultiplier(2)->Range(1, 64);
 
 #define BENCH_PTR(name, atomic_sp, sp)                                        \
   SETUP_BENCHMARK(name, "load", (bench_load<atomic_sp, sp>));                 \
@@ -161,7 +180,7 @@ static void bench_store_copy(benchmark::State& state) {
 
 
 //BENCH_PTR("STL", StlAtomicSharedPtr, std::shared_ptr);
-//BENCH_PTR("Folly", folly::atomic_shared_ptr, std::shared_ptr);
+BENCH_PTR("Folly", folly::atomic_shared_ptr, std::shared_ptr);
 BENCH_PTR("Mine", parlay::atomic_shared_ptr, parlay::shared_ptr);
 //BENCH_PTR("JSS-Free", jss::atomic_shared_ptr, jss::shared_ptr);
 //BENCH_PTR("Vtyulb", LFStructs::AtomicSharedPtr, LFStructs::SharedPtr);

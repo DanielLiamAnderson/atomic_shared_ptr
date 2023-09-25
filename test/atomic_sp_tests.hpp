@@ -6,7 +6,7 @@
 #include <vector>
 
 TEST(TestAtomicSharedPtr, TestConstructionEmpty) {
-  parlay::enable_background_reclamation();
+  parlay::enable_deamortized_reclamation();
 
   atomic_shared_ptr<int> p;
   

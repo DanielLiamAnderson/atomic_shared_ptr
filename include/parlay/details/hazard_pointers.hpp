@@ -50,6 +50,7 @@ inline constexpr std::size_t CACHE_LINE_ALIGNMENT = 128;
 enum class ReclamationMethod {
   amortized_reclamation,                // Reclamation happens in bulk in the retiring thread
   background_thread_reclamation,        // Reclamation happens asynchronously in a background thread
+  deamortized_reclamation               // Reclamation happens spread out over the retiring thread
 };
 
 template<typename T>
@@ -121,6 +122,23 @@ class HazardPointers {
       if (p->get_next() == nullptr) [[unlikely]] tail = p;
     }
 
+    void append(RetiredList&& other) {
+      if (head == nullptr) {
+        head = std::exchange(other.head, nullptr);
+        tail = std::exchange(other.tail, nullptr);
+      }
+      else if (other.head != nullptr) {
+        assert(tail != nullptr && "Can not append to a RetiredList with a detached tail.");
+        tail->set_next(std::exchange(other.head, nullptr));
+        tail = std::exchange(other.tail, nullptr);
+      }
+    }
+
+    void swap(RetiredList& other) {
+      std::swap(head, other.head);
+      std::swap(tail, other.tail);
+    }
+
     // For each element x currently in the retired list, if is_protected(x) == false,
     // then x->destroy() and remove x from the retired list.  Otherwise, keep x on
     // the retired list for the next cleanup.
@@ -144,15 +162,37 @@ class HazardPointers {
             prev = std::exchange(current, current->get_next());
           }
         }
+        tail = prev;
+      }
+      else {
+        tail = nullptr;
+      }
+    }
+
+    // Cleanup *at most* n retired objects. For up to n elements x currently in the retired list,
+    // if is_protected(x) == false, then x->destroy() and remove x from the retired list. Otherwise,
+    // move x onto the "into" list.
+    template<typename F>
+    void eject_and_move(std::size_t n, RetiredList& into, F&& is_protected) {
+      for (; head && n > 0; --n) {
+        garbage_type* current = std::exchange(head, head->get_next());
+        if (is_protected(current)) {
+          into.push(current);
+        }
+        else {
+          current->destroy();
+        }
+      }
+      if (head == nullptr) {
+        tail = nullptr;
       }
     }
 
     // For each element x currently in the retired list, if is_protected(x) == false,
     // then x->destroy() and remove x from the retired list.  Otherwise, move x onto
-    // the leftovers list.  Leaves the current list empty.
+    // the "into" list.  Leaves the current list empty.
     template<typename F>
     void cleanup_and_move(RetiredList& into, F&& is_protected) {
-
       while (head) {
         garbage_type* current = std::exchange(head, head->get_next());
         if (is_protected(current)) {
@@ -162,11 +202,16 @@ class HazardPointers {
           current->destroy();
         }
       }
+      tail = nullptr;
+      assert(head == nullptr);
     }
 
     garbage_type* head{nullptr};
     garbage_type* tail{nullptr};
   };
+
+  struct BackgroundReclaimer;
+  struct DeamortizedReclaimer;
 
   // Each thread owns a hazard entry slot which contains a single hazard pointer
   // (called protected_pointer) and the thread's local retired list.
@@ -198,7 +243,7 @@ class HazardPointers {
     // during the previous call to cleanup().
     protected_set_type protected_set{2 * std::thread::hardware_concurrency()};
 
-    protected_set_type next_protected_set{2 * std::thread::hardware_concurrency()};
+    std::unique_ptr<DeamortizedReclaimer> deamortized_reclaimer{nullptr};
 
     // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     //   Above: Single-writier thread-local variables. Written by the owning thread
@@ -227,6 +272,9 @@ class HazardPointers {
       }
       if (current->next.load() == nullptr) {
         auto my_slot = new HazardSlot{true};
+        if (mode == ReclamationMethod::deamortized_reclamation) {
+          my_slot->deamortized_reclaimer = std::make_unique<DeamortizedReclaimer>(*my_slot, list_head);
+        }
         HazardSlot* next = nullptr;
         while (!current->next.compare_exchange_weak(next, my_slot)) {
           current = next;
@@ -295,12 +343,23 @@ public:
     static_assert(std::is_convertible_v<std::invoke_result_t<F, U>, garbage_type*>);
     auto &slot = local_slot.my_slot->protected_ptr;
 
-    U result = src.load(std::memory_order_relaxed);
+    U result = src.load(std::memory_order_acquire);
 
     while (true) {
-      PARLAY_PREFETCH(f(result), 0, 0);
-      slot.store(f(result), std::memory_order_relaxed);
-      folly::asymmetric_thread_fence_light(std::memory_order_seq_cst);    /*  Fast-side fence  */
+      auto ptr_to_protect = f(result);
+      if (ptr_to_protect == nullptr) {
+        return result;
+      }
+      PARLAY_PREFETCH(ptr_to_protect, 0, 0);
+      if (false && mode == ReclamationMethod::deamortized_reclamation) {
+        // In deamortized mode we want the slow path to be less slow, so
+        // we fall back to doing a regular fenced store in the fast path
+        slot.store(ptr_to_protect, std::memory_order_seq_cst);
+      }
+      else {
+        slot.store(ptr_to_protect, std::memory_order_relaxed);
+        folly::asymmetric_thread_fence_light(std::memory_order_seq_cst);    /*  Fast-side fence  */
+      }
       U current_value = src.load(std::memory_order_acquire);
       if (current_value == result) [[likely]] {
         return result;
@@ -328,17 +387,32 @@ public:
     HazardSlot& my_slot = *local_slot.my_slot;
     my_slot.retired_list.push(p);
 
-    if (++my_slot.num_retires_since_cleanup >= cleanup_threshold) [[unlikely]] {
+    if (mode == ReclamationMethod::deamortized_reclamation) {
+      assert(my_slot.deamortized_reclaimer != nullptr);
+      my_slot.deamortized_reclaimer->do_reclamation_work();
+    }
+    else if (++my_slot.num_retires_since_cleanup >= cleanup_threshold) [[unlikely]] {
       cleanup(my_slot);
     }
   }
 
   // Change the reclamation method.  Not thread safe, and not safe to call concurrently
   // while any hazard pointers are held, or while another thread might retire something.
+  //
+  // Mode can only be changed once!!
   void enable_background_reclamation() {
     // Start a reclaimer thread
+    assert(mode == ReclamationMethod::amortized_reclamation);
     reclaimer_thread = std::jthread(BackgroundReclaimer{*this});
     mode = ReclamationMethod::background_thread_reclamation;
+  }
+
+  void enable_deamortized_reclamation() {
+    assert(mode == ReclamationMethod::amortized_reclamation);
+    for_each_slot([&](HazardSlot& slot) {
+      slot.deamortized_reclaimer = std::make_unique<DeamortizedReclaimer>(slot, list_head);
+    });
+    mode = ReclamationMethod::deamortized_reclamation;
   }
 
 private:
@@ -390,34 +464,52 @@ private:
 
   struct DeamortizedReclaimer {
 
-    void do_some_reclamation() {
+    explicit DeamortizedReclaimer(HazardSlot& slot_, HazardSlot* const head_) : my_slot(slot_), head_slot(head_) { }
+
+    void do_reclamation_work() {
       num_retires++;
 
       if (current_slot == nullptr) {
-        if (num_retires < 2 * num_hazard_pointers) {
-
+        if (num_retires < 2 * num_hazard_ptrs) {
+          // Need to batch 2P retires before scanning hazard pointers to ensure
+          // that we eject at least P blocks to make it worth the work.
+          return;
         }
-
+        // There are at least 2*num_hazard_pointers objects awaiting reclamation
+        num_retires = 0;
+        num_hazard_ptrs = std::exchange(next_num_hazard_ptrs, 0);
         current_slot = head_slot;
-
         protected_set.swap(next_protected_set);
-        next_protected_set.clear();     // The only not-O(1) operation, but its fast
+        next_protected_set.clear();                 // The only not-O(1) operation, but its fast
+
+        eligible.append(std::move(next_eligible));
+        next_eligible.swap(my_slot.retired_list);
       }
 
+      // Eject up to two elements from the eligible set.  It has to be two because we waited until
+      // we had 2 * num_hazard_ptrs eligible objects, so we want that to be processed by the time
+      // we get through the hazard-pointer list again.
+      eligible.eject_and_move(2, my_slot.retired_list, [&](auto p) { return protected_set.count(p) > 0; });
 
-
+      next_num_hazard_ptrs++;
+      next_protected_set.insert(current_slot->protected_ptr.load());
+      current_slot = current_slot->next;
     }
 
+    HazardSlot& my_slot;
     HazardSlot* const head_slot;
-    HazardSlot* current_slot;
+    HazardSlot* current_slot{nullptr};
 
-    protected_set_type protected_set;
-    protected_set_type next_protected_set;
+    protected_set_type protected_set{2*std::thread::hardware_concurrency()};
+    protected_set_type next_protected_set{2*std::thread::hardware_concurrency()};
 
-    RetiredList eligible;
-    RetiredList next_eligible;
+    RetiredList eligible{};
+    RetiredList next_eligible{};
 
-    unsigned int num_hazard_pointers{std::thread::hardware_concurrency()};     // A local estimate of the number of active hazard pointers
+    // A local estimate of the number of active hazard pointers
+    unsigned int num_hazard_ptrs{std::thread::hardware_concurrency()};
+    unsigned int next_num_hazard_ptrs{std::thread::hardware_concurrency()};
+
     unsigned int num_retires{0};
   };
 

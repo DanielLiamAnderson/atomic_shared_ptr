@@ -21,8 +21,8 @@ struct WaitFreeCounter {
   WaitFreeCounter() noexcept : x(1) {}
   explicit WaitFreeCounter(T desired) noexcept : x(desired) {}
 
-  [[nodiscard]] bool is_lock_free() const { return true; }
-  static constexpr bool is_always_lock_free = true;
+  [[nodiscard]] bool is_lock_free() const { return x.is_lock_free(); }
+  static constexpr bool is_always_lock_free = std::atomic<T>::is_always_lock_free;
   [[nodiscard]] constexpr T max_value() const { return zero_pending_flag - 1; }
 
   WaitFreeCounter& operator=(const WaitFreeCounter&) = delete;

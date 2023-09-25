@@ -58,7 +58,6 @@ struct control_block_base {
   template<typename T>
   friend class atomic_shared_ptr;
 
-  template<typename... Args>
   explicit control_block_base(void* ptr_) noexcept : strong_count(1), weak_count(1), ptr(ptr_) { }
 
   control_block_base(const control_block_base &) = delete;
@@ -156,6 +155,8 @@ struct control_block_inplace_base : public control_block_base {
 
   T* get() const noexcept { return const_cast<T*>(std::addressof(object)); }
 
+  ~control_block_inplace_base() override { }
+
   // Store the object inside a union, so we get precise control over its lifetime
   union {
     T object;
@@ -173,13 +174,11 @@ struct control_block_inplace final : public control_block_inplace_base<T> {
   }
 
   template<typename... Args>
-    requires (!(std::is_same_v<for_overwrite_tag, Args> && ...))
+    requires (!(std::is_same_v<for_overwrite_tag, Args> || ...))
   explicit control_block_inplace(Args&&... args) {
     ::new(static_cast<void*>(this->get())) T(std::forward<Args>(args)...);
     this->set_ptr(this->get());
   }
-  
-  ~control_block_inplace() noexcept = default;
   
   void dispose() noexcept override {
     this->get()->~T();
