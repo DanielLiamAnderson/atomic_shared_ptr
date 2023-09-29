@@ -5,16 +5,17 @@
 #include "details/atomic_details.hpp"
 #include "details/hazard_pointers.hpp"
 
+//#include "shared_ptr_opt.hpp"
 #include "shared_ptr.hpp"
 
 namespace parlay {
 
 inline void enable_background_reclamation() {
-  get_hazard_list<parlay::details::control_block_base>().enable_background_reclamation();
+  //get_hazard_list<parlay::details::control_block_base>().enable_background_reclamation();
 }
 
 inline void enable_deamortized_reclamation() {
-  get_hazard_list<parlay::details::control_block_base>().enable_deamortized_reclamation();
+  //get_hazard_list<parlay::details::control_block_base>().enable_deamortized_reclamation();
 }
 
 template<typename T>
@@ -22,6 +23,7 @@ class atomic_shared_ptr {
   
   using shared_ptr_type = shared_ptr<T>;
   using control_block_type = details::control_block_base;
+  //using control_block_type = details::fast_control_block<T>;
   
  public:
   
