@@ -19,7 +19,6 @@
 #include <folly/synchronization/AsymmetricThreadFence.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
-#include "immortal.hpp"
 
 namespace parlay {
 
@@ -245,22 +244,7 @@ class HazardPointers {
 
     std::unique_ptr<DeamortizedReclaimer> deamortized_reclaimer{nullptr};
 
-    // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    //   Above: Single-writier thread-local variables. Written by the owning thread
-    // =============================================================================
-    //   Below: Data shared with other threads and used by the background reclaimer
-    // vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-
-    // True if a thread owns this slot, else false.
-    alignas(CACHE_LINE_ALIGNMENT) std::atomic<bool> in_use;
-
-    // A synchronized location for the main thread to hand off garbage
-    // to the background reclaimer thread.
-    std::atomic<garbage_type*> available_garbage{nullptr};
-
-    // Local (unsynchronized) variables used by the background reclaimer thread.
-    garbage_type* old_garbage{nullptr};
-    garbage_type* prev_garbage{nullptr};
+    std::atomic<bool> in_use;
   };
 
   // Find an available hazard slot, or allocate a new one if none available.
@@ -321,10 +305,6 @@ public:
   }
 
   ~HazardPointers() {
-    if (mode == ReclamationMethod::background_thread_reclamation) {
-      reclaimer_thread.request_stop();
-      reclaimer_thread.join();
-    }
     auto current = list_head;
     while (current) {
       auto old = std::exchange(current, current->next.load());
@@ -396,17 +376,6 @@ public:
     }
   }
 
-  // Change the reclamation method.  Not thread safe, and not safe to call concurrently
-  // while any hazard pointers are held, or while another thread might retire something.
-  //
-  // Mode can only be changed once!!
-  void enable_background_reclamation() {
-    // Start a reclaimer thread
-    assert(mode == ReclamationMethod::amortized_reclamation);
-    reclaimer_thread = std::jthread(BackgroundReclaimer{*this});
-    mode = ReclamationMethod::background_thread_reclamation;
-  }
-
   void enable_deamortized_reclamation() {
     assert(mode == ReclamationMethod::amortized_reclamation);
     for_each_slot([&](HazardSlot& slot) {
@@ -416,51 +385,6 @@ public:
   }
 
 private:
-
-  struct BackgroundReclaimer {
-
-    explicit BackgroundReclaimer(HazardPointers& parent_) : parent(parent_) { }
-
-    void operator()(std::stop_token stoken) {
-
-      folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
-
-      // Start the garbage pipeline by acquiring the set of announced hazard pointers.
-      // The first set can not be interleaved since we can only retire garbage that we
-      // know was retired before we read every announced hazard pointer.
-      parent.for_each_slot([&](HazardSlot& slot) {
-        slot.old_garbage = slot.available_garbage.exchange(nullptr);
-      });
-      parent.scan_hazard_pointers([&](garbage_type* p) {
-        protected_set.insert(p);
-      });
-
-      while (!stoken.stop_requested()) {
-        folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
-
-        leftovers.cleanup([&](auto p) { return protected_set.count(p) > 0; });
-
-        parent.for_each_slot([&](HazardSlot& slot) {
-          RetiredList list(std::exchange(slot.old_garbage, slot.prev_garbage));
-          list.cleanup_and_move(leftovers, [&](auto p) { return protected_set.count(p) > 0; });
-
-          slot.prev_garbage = slot.available_garbage.exchange(nullptr);
-          next_protected_set.insert(slot.protected_ptr.load());
-        });
-
-        protected_set.swap(next_protected_set);
-        next_protected_set.clear();
-
-        std::this_thread::sleep_for(std::chrono::microseconds(10));
-      }
-
-    }
-
-    HazardPointers& parent;
-    RetiredList leftovers;
-    protected_set_type next_protected_set{2 * std::thread::hardware_concurrency()};
-    protected_set_type protected_set{2 * std::thread::hardware_concurrency()};
-  };
 
   struct DeamortizedReclaimer {
 
@@ -535,39 +459,20 @@ private:
 
   FOLLY_NOINLINE void cleanup(HazardSlot& slot) {
     slot.num_retires_since_cleanup = 0;
-
-    if (mode == ReclamationMethod::amortized_reclamation) {
-      // Perform reclamation now on the current thread
-      folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
-      scan_hazard_pointers([&](auto p) { slot.protected_set.insert(p); });
-      slot.retired_list.cleanup([&](auto p) { return slot.protected_set.count(p) > 0; });
-      slot.protected_set.clear();    // Does not free memory, only clears contents
-    }
-    else {
-      // Perform reclamation on the executor. Note that there is only one thread in the
-      // thread pool because the reclamation method below is not thread safe.
-      assert(mode == ReclamationMethod::background_thread_reclamation);
-
-      // Hand off retired list
-      garbage_type* current_available = slot.available_garbage.exchange(nullptr);
-      slot.retired_list.tail->set_next(current_available);
-      slot.available_garbage.store(std::exchange(slot.retired_list.head, nullptr));
-    }
+    folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
+    scan_hazard_pointers([&](auto p) { slot.protected_set.insert(p); });
+    slot.retired_list.cleanup([&](auto p) { return slot.protected_set.count(p) > 0; });
+    slot.protected_set.clear();    // Does not free memory, only clears contents
   }
 
   ReclamationMethod mode{ReclamationMethod::amortized_reclamation};
   HazardSlot* const list_head;
 
-  // Background thread that reclaims unprotected garbage
-  std::jthread reclaimer_thread{};
-
-
   static inline const thread_local HazardSlotOwner local_slot{get_hazard_list<garbage_type>()};
 };
 
 
-// Global singleton containing the list of hazard pointers.  Wrapping it
-// inside an Immortal means it is never destroyed, even at termination.
+// Global singleton containing the list of hazard pointers.
 //
 // (i.e., a detached thread might grab a HazardSlot entry and not relinquish
 // it until static destruction, at which point this global static would have
@@ -577,10 +482,9 @@ private:
 // a price we are willing to pay.
 template<typename GarbageType>
 HazardPointers<GarbageType>& get_hazard_list() {
-  static_assert(std::is_trivially_destructible_v<detail::Immortal<HazardPointers<GarbageType>>>);
-
-  static detail::Immortal<HazardPointers<GarbageType>> list;
-  return list;
+  alignas(HazardPointers<GarbageType>) static char buffer[sizeof(HazardPointers<GarbageType>)];
+  static auto* list = new (&buffer) HazardPointers<GarbageType>{};
+  return *list;
 }
 
 }  // namespace parlay
