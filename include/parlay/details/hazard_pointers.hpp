@@ -86,7 +86,7 @@ class HazardPointers {
 
   // After this many retires, a thread will attempt to clean up the contents of
   // its local retired list, deleting any retired objects that are not protected.
-  constexpr static std::size_t cleanup_threshold = 1000;
+  constexpr static std::size_t cleanup_threshold = 100;
 
   using garbage_type = GarbageType;
   using protected_set_type = folly::F14FastSet<garbage_type*>;

@@ -21,7 +21,7 @@ namespace details {
 using ref_cnt_type = uint32_t;
 
 
-// All-in one optimized control block.
+// Minimal, optimized control block.  No alias support, or custom deleter, or custom allocator.
 template<typename T>
 struct fast_control_block {
 
@@ -30,11 +30,11 @@ struct fast_control_block {
   template<typename U>
   friend class atomic_shared_ptr;
 
-  fast_control_block(T* ptr_) : strong_count(1), inline_alloc(false), ptr(ptr_) { }    // NOLINT
+  fast_control_block(T* ptr_) : strong_count(1), ptr(ptr_), inline_alloc(false) { }    // NOLINT
 
   template<typename... Args>
   fast_control_block(inline_tag, Args&&... args)                                 // NOLINT
-    : strong_count(1), inline_alloc(true), object(std::forward<Args>(args)...) { }
+    : strong_count(1), object(std::forward<Args>(args)...), inline_alloc(true) { }
 
 
   fast_control_block(const fast_control_block &) = delete;
@@ -82,11 +82,17 @@ struct fast_control_block {
   fast_control_block* get_next() const noexcept { return next_; }
   void set_next(fast_control_block* next) noexcept { next_ = next; }
 
-  T* get_ptr() const noexcept { return const_cast<T*>(ptr); }
+  T* get_ptr() const noexcept {
+    if (inline_alloc) return const_cast<T*>(std::addressof(object));
+    else return const_cast<T*>(ptr);
+  }
 
   auto get_use_count() const noexcept { return strong_count.load(std::memory_order_relaxed); }
 
 private:
+
+  WaitFreeCounter<ref_cnt_type> strong_count;
+  const bool inline_alloc;
 
   union {
     std::monostate empty;
@@ -95,8 +101,6 @@ private:
     T object;
   };
 
-  WaitFreeCounter<ref_cnt_type> strong_count;
-  const bool inline_alloc;
 };
 
 static_assert(sizeof(fast_control_block<int>) == 16);
@@ -127,7 +131,7 @@ public:
   smart_ptr_base& operator=(const smart_ptr_base&) = delete;
 
   [[nodiscard]] element_type* get() const noexcept {
-    return control_block->get_ptr();
+    return control_block ? control_block->get_ptr() : nullptr;
   }
 
 protected:
@@ -192,7 +196,9 @@ class shared_ptr : public details::smart_ptr_base<T> {
   friend class shared_ptr;
 
   // Private constructor used by atomic_shared_ptr::load and weak_ptr::lock
-  shared_ptr(T* ptr_, details::fast_control_block<T>* control_block_) : base(control_block_) { }
+  shared_ptr([[maybe_unused]] T* ptr_, details::fast_control_block<T>* control_block_) : base(control_block_) {
+    assert(ptr_ == control_block_->get_ptr() && "This shared_ptr does not support alias pointers.");
+  }
 
 public:
   using typename base::element_type;
@@ -300,7 +306,7 @@ private:
   // Release the ptr and control_block to the caller.  Does not modify the reference count,
   // so the caller is responsible for taking over the reference count owned by this copy
   std::pair<T*, details::fast_control_block<T>*> release_internals() noexcept {
-    auto p = this->control_block->get_ptr();
+    auto p = this->control_block ? this->control_block->get_ptr() : nullptr;
     return std::make_pair(p, std::exchange(this->control_block, nullptr));
   }
 
@@ -321,6 +327,8 @@ Deleter* get_deleter(const shared_ptr<T>& sp) noexcept {
 template<typename T, typename... Args>
 [[nodiscard]] shared_ptr<T> make_shared(Args&&... args) {
   const auto control_block = new details::fast_control_block<T>(typename details::fast_control_block<T>::inline_tag{}, std::forward<Args>(args)...);
+  assert(control_block != nullptr);
+  assert(control_block->get_ptr() != nullptr);
   shared_ptr<T> result(control_block->get_ptr(), control_block);
   return result;
 }

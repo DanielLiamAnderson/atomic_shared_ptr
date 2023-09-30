@@ -72,6 +72,12 @@ struct control_block_base {
   // calling destroy.  Called when the weak count hits zero.
   virtual void destroy() noexcept = 0;
 
+  // Delay the destroy using hazard pointers in case there are in in-flight increments.
+  void retire() noexcept {
+    // Defer destruction of the control block using hazard pointers
+    get_hazard_list<control_block_base>().retire(this);
+  }
+
   // Return the custom deleter for this object if the deleter has the type,
   // indicated by the argument, otherwise return nullptr
   virtual void* get_deleter(std::type_info&) const noexcept { return nullptr; }
@@ -113,19 +119,17 @@ struct control_block_base {
   }
 
   // Release weak references to the object. If this causes the weak reference count
-  // to hit zero, the control block is ready to be destroyed.  We delay the destroy
-  // using hazard pointers in case there are in in-flight increments.
+  // to hit zero, the control block is ready to be destroyed.
   void decrement_weak_count() noexcept {
     if (weak_count.fetch_sub(1, std::memory_order_release) == 1) {
-      // Defer destruction of the control block using hazard pointers
-      get_hazard_list<control_block_base>().retire(this);
+      retire();
     }
   }
 
-  control_block_base* get_next() const noexcept { return next_; }
+  [[nodiscard]] control_block_base* get_next() const noexcept { return next_; }
   void set_next(control_block_base* next) noexcept { next_ = next; }
 
-  void* get_ptr() const noexcept { return const_cast<void*>(ptr); }
+  [[nodiscard]] void* get_ptr() const noexcept { return const_cast<void*>(ptr); }
 
   auto get_use_count() const noexcept { return strong_count.load(std::memory_order_relaxed); }
   auto get_weak_count() const noexcept { return weak_count.load(std::memory_order_relaxed); }
@@ -160,7 +164,7 @@ struct control_block_inplace_base : public control_block_base {
   // Store the object inside a union, so we get precise control over its lifetime
   union {
     T object;
-    std::monostate empty;
+    std::monostate empty{};
   };
 };
 
