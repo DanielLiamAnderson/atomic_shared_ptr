@@ -48,6 +48,10 @@ target_link_libraries(parlay_atomic_shared_ptr INTERFACE Boost::atomic)
 find_package(folly REQUIRED)
 target_link_libraries(parlay_atomic_shared_ptr INTERFACE folly glog dl double-conversion fmt gflags)
 
+# We use Parlay for its pool allocator
+find_package(Parlay REQUIRED)
+target_link_libraries(parlay_atomic_shared_ptr INTERFACE parlay)
+
 # Configure just::threads (Anthony William's commercial library with a lock-free atomic_shared_ptr)
 # if available.  We will perform benchmarks against it if it is installed, otherwise we skip it
 find_library(JUST_THREADS_LIB NAMES justthread)

@@ -7,6 +7,8 @@
 #include "details/hazard_pointers.hpp"
 #include "details/wait_free_counter.hpp"
 
+#include "../external/parlay/alloc.h"
+
 namespace parlay {
 
 template<typename T>
@@ -24,6 +26,15 @@ using ref_cnt_type = uint32_t;
 // Minimal, optimized control block.  No alias support, or custom deleter, or custom allocator.
 template<typename T>
 struct fast_control_block {
+
+  static void* operator new(std::size_t sz) {
+    assert(sz == 1);
+    return parlay::type_allocator<fast_control_block>::alloc();
+  }
+
+  static void operator delete(void* ptr) {
+    parlay::type_allocator<fast_control_block>::free(static_cast<fast_control_block*>(ptr));
+  }
 
   struct inline_tag {};
 

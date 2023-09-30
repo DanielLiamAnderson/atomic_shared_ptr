@@ -5,8 +5,8 @@
 #include "details/atomic_details.hpp"
 #include "details/hazard_pointers.hpp"
 
-#include "shared_ptr_opt.hpp"
-//#include "shared_ptr.hpp"
+//#include "shared_ptr_opt.hpp"
+#include "shared_ptr.hpp"
 
 namespace parlay {
 
@@ -18,8 +18,8 @@ template<typename T>
 class atomic_shared_ptr {
   
   using shared_ptr_type = shared_ptr<T>;
-  //using control_block_type = details::control_block_base;
-  using control_block_type = details::fast_control_block<T>;
+  using control_block_type = details::control_block_base;
+  //using control_block_type = details::fast_control_block<T>;
   
  public:
   
@@ -52,7 +52,7 @@ class atomic_shared_ptr {
       current_control_block = hazptr.protect(control_block);
       if (current_control_block == nullptr || current_control_block->increment_strong_count_if_nonzero()) break;
     }
-    
+
     return make_shared_from_ctrl_block(current_control_block);
   }
   

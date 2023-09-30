@@ -19,6 +19,8 @@
 #include "details/hazard_pointers.hpp"
 #include "details/wait_free_counter.hpp"
 
+#include <parlay/alloc.h>
+
 namespace parlay {
 
 template<typename T>
@@ -171,6 +173,17 @@ struct control_block_inplace_base : public control_block_base {
 
 template<typename T>
 struct control_block_inplace final : public control_block_inplace_base<T> {
+
+  // TODO: Don't hardcode an allocator override here.  Should just
+  // use allocate_shared and pass in an appropriate allocator.
+  static void* operator new(std::size_t sz) {
+    assert(sz == sizeof(control_block_inplace));
+    return parlay::type_allocator<control_block_inplace>::alloc();
+  }
+
+  static void operator delete(void* ptr) {
+    parlay::type_allocator<control_block_inplace>::free(static_cast<control_block_inplace*>(ptr));
+  }
 
   explicit control_block_inplace(for_overwrite_tag) {
     ::new(static_cast<void*>(this->get())) T;   // Default initialization when using make_shared_for_overwrite

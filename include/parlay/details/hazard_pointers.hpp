@@ -15,23 +15,11 @@
 #include <utility>
 
 #include <folly/container/F14Set.h>
-
 #include <folly/synchronization/AsymmetricThreadFence.h>
-#include <folly/executors/CPUThreadPoolExecutor.h>
 
+#include <parlay/portability.h>
 
 namespace parlay {
-
-// PARLAY_PREFETCH: Prefetch data into cache
-#if defined(__GNUC__)
-#define PARLAY_PREFETCH(addr, rw, locality) __builtin_prefetch ((addr), (rw), (locality))
-#elif defined(_WIN32)
-#define PARLAY_PREFETCH(addr, rw, locality)                                                 \
-  PreFetchCacheLine(((locality) ? PF_TEMPORAL_LEVEL_1 : PF_NON_TEMPORAL_LEVEL_ALL), (addr))
-#else
-#define PARLAY_PREFETCH(addr, rw, locality)
-#endif
-
 
 #ifdef __cpp_lib_hardware_interference_size
 
@@ -48,7 +36,6 @@ inline constexpr std::size_t CACHE_LINE_ALIGNMENT = 128;
 
 enum class ReclamationMethod {
   amortized_reclamation,                // Reclamation happens in bulk in the retiring thread
-  background_thread_reclamation,        // Reclamation happens asynchronously in a background thread
   deamortized_reclamation               // Reclamation happens spread out over the retiring thread
 };
 
@@ -77,16 +64,14 @@ extern inline HazardPointers<GarbageType>& get_hazard_list();
 // This means that a stalled thread can delay the destruction of its retired objects
 // indefinitely, however, since each thread is only allowed to protect a single object
 // at a time, it is guaranteed that there are at most O(P^2) total unreclaimed objects
-// at any given point, so the memory usage is theoretically bounded. This is assuming
-// cleanup is performed by the retiring thread.  If using background thread reclamation,
-// technically there is no guarantee of memory being freed in a timely manner since the
-// background thread could stall and not actually free anything.
+// at any given point, so the memory usage is theoretically bounded.
+//
 template<typename GarbageType> requires GarbageCollectible<GarbageType>
 class HazardPointers {
 
   // After this many retires, a thread will attempt to clean up the contents of
   // its local retired list, deleting any retired objects that are not protected.
-  constexpr static std::size_t cleanup_threshold = 100;
+  constexpr static std::size_t cleanup_threshold = 2000;
 
   using garbage_type = GarbageType;
   using protected_set_type = folly::F14FastSet<garbage_type*>;
@@ -127,7 +112,7 @@ class HazardPointers {
         tail = std::exchange(other.tail, nullptr);
       }
       else if (other.head != nullptr) {
-        assert(tail != nullptr && "Can not append to a RetiredList with a detached tail.");
+        assert(tail != nullptr);
         tail->set_next(std::exchange(other.head, nullptr));
         tail = std::exchange(other.tail, nullptr);
       }
@@ -187,29 +172,10 @@ class HazardPointers {
       }
     }
 
-    // For each element x currently in the retired list, if is_protected(x) == false,
-    // then x->destroy() and remove x from the retired list.  Otherwise, move x onto
-    // the "into" list.  Leaves the current list empty.
-    template<typename F>
-    void cleanup_and_move(RetiredList& into, F&& is_protected) {
-      while (head) {
-        garbage_type* current = std::exchange(head, head->get_next());
-        if (is_protected(current)) {
-          into.push(current);
-        }
-        else {
-          current->destroy();
-        }
-      }
-      tail = nullptr;
-      assert(head == nullptr);
-    }
-
     garbage_type* head{nullptr};
     garbage_type* tail{nullptr};
   };
 
-  struct BackgroundReclaimer;
   struct DeamortizedReclaimer;
 
   // Each thread owns a hazard entry slot which contains a single hazard pointer
@@ -234,17 +200,19 @@ class HazardPointers {
 
     // Count the number of retires since the last cleanup. When this value exceeds
     // cleanup_threshold, we will perform cleanup.
-    std::size_t num_retires_since_cleanup{0};
+    unsigned num_retires_since_cleanup{0};
+
+    // True if this hazard pointer slow is owned by a thread.
+    std::atomic<bool> in_use;
 
     // Set of protected objects used by cleanup().  Re-used between cleanups so that
     // we don't have to allocate new memory unless the table gets full, which would
     // only happen if the user spawns substantially more threads than were active
-    // during the previous call to cleanup().
+    // during the previous call to cleanup().  Therefore cleanup is always lock free
+    // unless the number of threads has doubled since last time.
     protected_set_type protected_set{2 * std::thread::hardware_concurrency()};
 
     std::unique_ptr<DeamortizedReclaimer> deamortized_reclaimer{nullptr};
-
-    std::atomic<bool> in_use;
   };
 
   // Find an available hazard slot, or allocate a new one if none available.
@@ -457,7 +425,7 @@ private:
     });
   }
 
-  FOLLY_NOINLINE void cleanup(HazardSlot& slot) {
+  PARLAY_NOINLINE void cleanup(HazardSlot& slot) {
     slot.num_retires_since_cleanup = 0;
     folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
     scan_hazard_pointers([&](auto p) { slot.protected_set.insert(p); });
@@ -472,11 +440,12 @@ private:
 };
 
 
-// Global singleton containing the list of hazard pointers.
+// Global singleton containing the list of hazard pointers. We store it in raw
+// storage so that it is never destructed.
 //
-// (i.e., a detached thread might grab a HazardSlot entry and not relinquish
-// it until static destruction, at which point this global static would have
-// already been destroyed. We avoid that using this pattern.)
+// (a detached thread might grab a HazardSlot entry and not relinquish it until
+// static destruction, at which point this global static would have already been
+// destroyed. We avoid that using this pattern.)
 //
 // This does technically mean that we leak the HazardSlots, but that is
 // a price we are willing to pay.
