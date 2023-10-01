@@ -157,16 +157,17 @@ struct control_block_inplace_base : public control_block_base {
     return static_cast<void*>(get());
   }
 
+  // Expose intrusive pointers used by Hazard Pointers
   [[nodiscard]] control_block_base* get_next() const noexcept override { return next_; }
   void set_next(control_block_base* next) noexcept override { next_ = next; }
 
   ~control_block_inplace_base() override { }
 
-  // Store the object inside a union, so we get precise control over its lifetime
+
   union {
     std::monostate empty{};
-    T object;
-    control_block_base* next_;
+    T object;                       // Since the object is inside a union, we get precise control over its lifetime
+    control_block_base* next_;      // Intrusive ptr used for garbage collection by Hazard Pointers
   };
 };
 
@@ -262,6 +263,7 @@ struct control_block_with_ptr : public control_block_base {
     return const_cast<T*>(ptr);
   }
 
+  // Expose intrusive pointers used by Hazard Pointers
   [[nodiscard]] control_block_base* get_next() const noexcept override { return next_; }
   void set_next(control_block_base* next) noexcept override { next_ = next; }
 
