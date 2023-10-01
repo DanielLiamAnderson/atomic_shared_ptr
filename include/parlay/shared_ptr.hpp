@@ -60,7 +60,7 @@ struct control_block_base {
   template<typename T>
   friend class atomic_shared_ptr;
 
-  explicit control_block_base(void* ptr_) noexcept : strong_count(1), weak_count(1), ptr(ptr_) { }
+  explicit control_block_base() noexcept : strong_count(1), weak_count(1) { }
 
   control_block_base(const control_block_base &) = delete;
   control_block_base& operator=(const control_block_base&) = delete;
@@ -128,25 +128,17 @@ struct control_block_base {
     }
   }
 
-  [[nodiscard]] control_block_base* get_next() const noexcept { return next_; }
-  void set_next(control_block_base* next) noexcept { next_ = next; }
+  [[nodiscard]] virtual control_block_base* get_next() const noexcept = 0;
+  virtual void set_next(control_block_base* next) noexcept = 0;
 
-  [[nodiscard]] void* get_ptr() const noexcept { return const_cast<void*>(ptr); }
+  [[nodiscard]] virtual void* get_ptr() const noexcept = 0;
 
   auto get_use_count() const noexcept { return strong_count.load(std::memory_order_relaxed); }
   auto get_weak_count() const noexcept { return weak_count.load(std::memory_order_relaxed); }
 
- protected:
-  void set_ptr(void* ptr_) noexcept { ptr = ptr_; }
-
  private:
   WaitFreeCounter<ref_cnt_type> strong_count;
   std::atomic<ref_cnt_type> weak_count;
-
-  union {
-    control_block_base* next_;     // Intrusive ptr used for garbage collection by Hazard pointers
-    void* ptr;                     // Pointer to the managed object while it is alive
-  };
 };
 
 
@@ -157,16 +149,24 @@ struct for_overwrite_tag {};
 template<typename T>
 struct control_block_inplace_base : public control_block_base {
   
-  control_block_inplace_base() : control_block_base(nullptr), empty{} { }
+  control_block_inplace_base() : control_block_base(), empty{} { }
 
   T* get() const noexcept { return const_cast<T*>(std::addressof(object)); }
+
+  void* get_ptr() const noexcept override {
+    return static_cast<void*>(get());
+  }
+
+  [[nodiscard]] control_block_base* get_next() const noexcept override { return next_; }
+  void set_next(control_block_base* next) noexcept override { next_ = next; }
 
   ~control_block_inplace_base() override { }
 
   // Store the object inside a union, so we get precise control over its lifetime
   union {
-    T object;
     std::monostate empty{};
+    T object;
+    control_block_base* next_;
   };
 };
 
@@ -187,14 +187,12 @@ struct control_block_inplace final : public control_block_inplace_base<T> {
 
   explicit control_block_inplace(for_overwrite_tag) {
     ::new(static_cast<void*>(this->get())) T;   // Default initialization when using make_shared_for_overwrite
-    this->set_ptr(this->get());
   }
 
   template<typename... Args>
     requires (!(std::is_same_v<for_overwrite_tag, Args> || ...))
   explicit control_block_inplace(Args&&... args) {
     ::new(static_cast<void*>(this->get())) T(std::forward<Args>(args)...);
-    this->set_ptr(this->get());
   }
   
   void dispose() noexcept override {
@@ -214,7 +212,7 @@ struct control_block_inplace_allocator final : public control_block_inplace_base
 
   control_block_inplace_allocator(Allocator, for_overwrite_tag) {
     ::new(static_cast<void*>(this->get())) T;   // Default initialization when using make_shared_for_overwrite
-    this->set_ptr(this->get());                 // Unfortunately not possible via the allocator since the C++
+                                                // Unfortunately not possible via the allocator since the C++
                                                 // standard forgot about this case, apparently.
   }
 
@@ -222,7 +220,6 @@ struct control_block_inplace_allocator final : public control_block_inplace_base
     requires (!(std::is_same_v<for_overwrite_tag, Args> && ...))
   explicit control_block_inplace_allocator(Allocator alloc_, Args&&... args) : alloc(alloc_) {
     std::allocator_traits<object_allocator_t>::construct(alloc, this->get(), std::forward<Args>(args)...);
-    this->set_ptr(this->get());
   }
   
   ~control_block_inplace_allocator() noexcept = default;
@@ -247,7 +244,7 @@ struct control_block_with_ptr : public control_block_base {
   
   using base = control_block_base;
   
-  explicit control_block_with_ptr(T* ptr_) : base(ptr_) { }
+  explicit control_block_with_ptr(T* ptr_) : ptr(ptr_) { }
   
   void dispose() noexcept override {
     delete get();
@@ -256,10 +253,22 @@ struct control_block_with_ptr : public control_block_base {
   void destroy()  noexcept override {
     delete this;
   }
-  
-  T* get() const noexcept {
-    return static_cast<T*>(this->get_ptr());
+
+  void* get_ptr() const noexcept override {
+    return static_cast<void*>(get());
   }
+
+  T* get() const noexcept {
+    return const_cast<T*>(ptr);
+  }
+
+  [[nodiscard]] control_block_base* get_next() const noexcept override { return next_; }
+  void set_next(control_block_base* next) noexcept override { next_ = next; }
+
+  union {
+    control_block_base* next_;     // Intrusive ptr used for garbage collection by Hazard pointers
+    T* ptr;                        // Pointer to the managed object while it is alive
+  };
 };
 
 // A control block pointing to a dynamically allocated object with a custom deleter
