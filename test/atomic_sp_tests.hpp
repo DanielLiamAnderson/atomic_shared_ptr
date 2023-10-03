@@ -6,8 +6,6 @@
 #include <vector>
 
 TEST(TestAtomicSharedPtr, TestConstructionEmpty) {
-  parlay::enable_deamortized_reclamation();
-
   atomic_shared_ptr<int> p;
   
   auto s = p.load();

@@ -11,7 +11,7 @@
 #include <experimental/atomic>
 #endif
 
-#include "parlay/atomic_shared_ptr_custom.hpp"
+#include "parlay/atomic_shared_ptr.hpp"
 
 #include "parlay/basic_atomic_shared_ptr.hpp"
 

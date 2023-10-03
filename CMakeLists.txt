@@ -49,7 +49,7 @@ find_package(folly REQUIRED)
 target_link_libraries(parlay_atomic_shared_ptr INTERFACE folly glog dl double-conversion fmt gflags)
 
 # We use Parlay for its pool allocator
-find_package(Parlay REQUIRED)
+find_package(Parlay 2.2.1 REQUIRED)
 target_link_libraries(parlay_atomic_shared_ptr INTERFACE Parlay::parlay)
 
 # Configure just::threads (Anthony William's commercial library with a lock-free atomic_shared_ptr)

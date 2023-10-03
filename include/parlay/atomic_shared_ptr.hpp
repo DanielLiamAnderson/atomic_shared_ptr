@@ -1,3 +1,8 @@
+// A lock-free atomic shared pointer for modern C++.  Not fully
+// feature complete yet.  Currently, support is missing for:
+//  - atomic_weak_ptr
+//  - aliased shared pointers
+
 #pragma once
 
 #include <atomic>
@@ -5,13 +10,16 @@
 #include "details/atomic_details.hpp"
 #include "details/hazard_pointers.hpp"
 
-//#include "shared_ptr_opt.hpp"
 #include "shared_ptr.hpp"
 
 namespace parlay {
 
+// Turn on deamortized reclamation.  This substantially improves the worst-case store
+// latency by spreading out reclamation over time instead of doing it in bulk, in
+// exchange for a slight increase in load latency.
 inline void enable_deamortized_reclamation() {
-  //get_hazard_list<parlay::details::control_block_base>().enable_deamortized_reclamation();;
+  // Experimental feature.  Still a work-in-progress!
+  get_hazard_list<parlay::details::control_block_base>().enable_deamortized_reclamation();
 }
 
 template<typename T>
@@ -19,7 +27,6 @@ class atomic_shared_ptr {
   
   using shared_ptr_type = shared_ptr<T>;
   using control_block_type = details::control_block_base;
-  //using control_block_type = details::fast_control_block<T>;
   
  public:
   

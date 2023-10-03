@@ -17,7 +17,7 @@
 #include <experimental/atomic>
 #endif
 
-#include "parlay/atomic_shared_ptr_custom.hpp"
+#include "parlay/atomic_shared_ptr.hpp"
 
 template<template<typename> typename SharedPtr, typename T, typename... Args>
 auto dispatch_make_shared(Args... args) {
@@ -34,9 +34,11 @@ auto dispatch_make_shared(Args... args) {
     // No make_shared in Vtyulb's SharedPtr type
     return LFStructs::SharedPtr<T>(new T(std::forward<Args>(args)...));
   }
+#if defined(JUST_THREADS_AVAILABLE)
   else if constexpr (std::is_same_v<SharedPtr<T>, std::experimental::shared_ptr<T>>) {
     return std::experimental::make_shared<T>(std::forward<Args>(args)...);
   }
+#endif
 }
 
 

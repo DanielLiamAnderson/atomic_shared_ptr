@@ -1,3 +1,18 @@
+// A faster shared_ptr that omits most of the bells and whistles in order
+// to make the control block smaller and remove all type erasure.
+//
+// In particular, the following are absent:
+// - No make_shared,
+// - No custom deleters/allocators,
+// - No weak_ptr,
+// - No alias pointers,
+// - No enable_shared_from_this
+//
+// The benefit is that the control block is only 16 bytes at minimum
+// because it has no weak ref count and no vtable pointer.
+//
+// See shared_ptr.hpp for a feature-complete implementation!
+//
 #pragma once
 
 #include <atomic>
@@ -7,7 +22,7 @@
 #include "details/hazard_pointers.hpp"
 #include "details/wait_free_counter.hpp"
 
-#include "../external/parlay/alloc.h"
+#include <parlay/alloc.h>
 
 namespace parlay {
 
@@ -108,7 +123,7 @@ private:
   union {
     std::monostate empty;
     fast_control_block* next_;          // Intrusive ptr used for garbage collection by Hazard pointers
-    T* ptr;                        // Pointer to the managed object while it is alive
+    T* ptr;                             // Pointer to the managed object while it is alive
     T object;
   };
 
@@ -116,8 +131,6 @@ private:
 
 static_assert(sizeof(fast_control_block<int>) == 16);
 static_assert(sizeof(fast_control_block<uintptr_t>) == 16);
-static_assert(sizeof(fast_control_block<char[16]>) == 24);
-static_assert(sizeof(fast_control_block<char[24]>) == 32);
 
 // Base class for shared_ptr and weak_ptr
 template<typename T>

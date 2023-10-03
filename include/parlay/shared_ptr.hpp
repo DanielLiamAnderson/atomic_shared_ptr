@@ -1,5 +1,5 @@
 // A custom modernized C++20 shared_ptr and weak_ptr implementation used by the atomic_shared_ptr.
-
+//
 // It tries to closely match the standard library std::shared_ptr as much as possible. Most  of the
 // code roughly follows the same implementation strategies as libstdc++, libc++, and Microsoft STL.
 //
@@ -7,7 +7,7 @@
 // allow atomic_shared_ptr to be lock free and not require a split reference count.
 //
 // No support for std::shared_ptr<T[]>, i.e., shared pointers of arrays. Everything else should
-// be supported.
+// be supported, including custom deleters, allocators, weak_ptrs, enable_shared_from_this, etc.
 //
 
 #pragma once

@@ -5,13 +5,10 @@
 #include <cstddef>
 
 #include <atomic>
-#include <deque>
 #include <memory>
 #include <new>
-#include <stop_token>
 #include <thread>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 
 #include <folly/container/F14Set.h>
@@ -299,15 +296,9 @@ public:
         return result;
       }
       PARLAY_PREFETCH(ptr_to_protect, 0, 0);
-      if (false && mode == ReclamationMethod::deamortized_reclamation) {
-        // In deamortized mode we want the slow path to be less slow, so
-        // we fall back to doing a regular fenced store in the fast path
-        slot.store(ptr_to_protect, std::memory_order_seq_cst);
-      }
-      else {
-        slot.store(ptr_to_protect, std::memory_order_relaxed);
-        folly::asymmetric_thread_fence_light(std::memory_order_seq_cst);    /*  Fast-side fence  */
-      }
+      slot.store(ptr_to_protect, protection_order);
+      folly::asymmetric_thread_fence_light(std::memory_order_seq_cst);    /*  Fast-side fence  */
+
       U current_value = src.load(std::memory_order_acquire);
       if (current_value == result) [[likely]] {
         return result;
@@ -343,13 +334,14 @@ public:
       cleanup(my_slot);
     }
   }
-
+  
   void enable_deamortized_reclamation() {
     assert(mode == ReclamationMethod::amortized_reclamation);
     for_each_slot([&](HazardSlot& slot) {
       slot.deamortized_reclaimer = std::make_unique<DeamortizedReclaimer>(slot, list_head);
     });
     mode = ReclamationMethod::deamortized_reclamation;
+    protection_order = std::memory_order_seq_cst;
   }
 
 private:
@@ -434,6 +426,7 @@ private:
   }
 
   ReclamationMethod mode{ReclamationMethod::amortized_reclamation};
+  std::memory_order protection_order{std::memory_order_relaxed};
   HazardSlot* const list_head;
 
   static inline const thread_local HazardSlotOwner local_slot{get_hazard_list<garbage_type>()};

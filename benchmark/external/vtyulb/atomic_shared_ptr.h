@@ -203,7 +203,7 @@ public:
     bool compare_exchange_weak(SharedPtr<T>& expected, SharedPtr<T> desired);
 
     void store(T *data);
-    void store(SharedPtr<T>&& data);
+    void store(SharedPtr<T> data);
 
 private:
     void destroyOldControlBlock(size_t oldPackedPtr);
@@ -294,7 +294,7 @@ void AtomicSharedPtr<T>::store(T *data) {
 }
 
 template<typename T>
-void AtomicSharedPtr<T>::store(SharedPtr<T> &&data) {
+void AtomicSharedPtr<T>::store(SharedPtr<T> data) {
     while (true) {
         auto holder = this->getFast();
         if (compareExchange(holder.get(), std::move(data))) {

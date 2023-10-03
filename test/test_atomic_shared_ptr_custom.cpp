@@ -8,7 +8,7 @@
 
 #include "gtest/gtest.h"
 
-#include <parlay/atomic_shared_ptr_custom.hpp>
+#include <parlay/atomic_shared_ptr.hpp>
 
 using parlay::atomic_shared_ptr;
 using parlay::shared_ptr;
